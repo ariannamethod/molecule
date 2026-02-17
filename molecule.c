@@ -1955,6 +1955,35 @@ static int cooccur_sample_next(CooccurField *cf, const int *ctx, int ctx_len, do
     return result;
 }
 
+/* Update corpus from chat messages */
+static void update_reservoir_corpus(sqlite3 *db, const char *corpus_path, int max_lines) {
+    StrArr docs = load_corpus(corpus_path);
+    int n_msgs;
+    Msg *msgs = db_recent(db, 200, &n_msgs);
+    int added = 0;
+    for (int i = 0; i < n_msgs; i++) {
+        if (strlen(msgs[i].text) < 5) continue;
+        /* Check if already in corpus (simple linear scan) */
+        int found = 0;
+        for (int j = 0; j < docs.len && !found; j++) {
+            if (strcmp(docs.items[j], msgs[i].text) == 0) found = 1;
+        }
+        if (!found) {
+            sa_push(&docs, msgs[i].text);
+            added++;
+        }
+    }
+    free(msgs);
+    /* Trim to max_lines */
+    while (docs.len > max_lines) {
+        free(docs.items[0]);
+        memmove(docs.items, docs.items + 1, sizeof(char*) * (docs.len - 1));
+        docs.len--;
+    }
+    if (added > 0) save_corpus(corpus_path, &docs);
+    sa_free(&docs);
+}
+
 /* ============================================================
  * 9) TRAINING
  * ============================================================ */
@@ -2096,6 +2125,66 @@ static char *build_prompt(sqlite3 *db, const char *user_text) {
     return buf;
 }
 
+/* Background trainer thread context */
+typedef struct {
+    sqlite3 *db;
+    GPT *model;
+    EvolvingTokenizer *tok;
+    QuantumBuffer *qbuf;
+    volatile int *warmed_up;
+    volatile int stop;
+} TrainerCtx;
+
+static void *background_trainer(void *arg) {
+    /* And lo, asynchronous training shall occur, because sleeping is for humans. */
+    TrainerCtx *ctx = (TrainerCtx *)arg;
+
+    while (!ctx->stop) {
+        update_reservoir_corpus(ctx->db, CFG.corpus_path, CFG.max_corpus_lines);
+        StrArr docs = load_corpus(CFG.corpus_path);
+
+        if (!*ctx->warmed_up && docs.len > 0) {
+            printf("[trainer] warmup training... (and so it begins)\n");
+            train_steps(ctx->model, ctx->tok, &docs, CFG.warmup_steps, 1, 1);
+            save_checkpoint(ctx->model, ctx->tok, NULL);
+            db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "warmup_complete");
+            *ctx->warmed_up = 1;
+            printf("[trainer] warmup complete. base may freeze now, like a proud fossil.\n");
+        }
+
+        if (*ctx->warmed_up && qb_should_trigger(ctx->qbuf) && docs.len > 0) {
+            int snap_bytes; double snap_novelty;
+            qb_snapshot(ctx->qbuf, &snap_bytes, &snap_novelty);
+            printf("[trainer] micro-train burst (%d bytes, novelty %.2f) — and lo, it feeds again.\n",
+                   snap_bytes, snap_novelty);
+            int train_base = !CFG.freeze_base_after_warmup;
+            train_steps(ctx->model, ctx->tok, &docs, CFG.micro_steps, train_base, 1);
+            save_checkpoint(ctx->model, ctx->tok, NULL);
+            db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "micro_burst");
+            qb_reset(ctx->qbuf);
+
+            if (ctx->model->n_deltas < CFG.max_delta_modules &&
+                rand_uniform() < CFG.delta_grow_prob) {
+                printf("[trainer] growing new delta module (total: %d) — new soul appended.\n",
+                       ctx->model->n_deltas + 1);
+                pthread_mutex_lock(&ctx->model->mu);
+                gpt_add_delta_module(ctx->model, 1.0);
+                pthread_mutex_unlock(&ctx->model->mu);
+                save_checkpoint(ctx->model, ctx->tok, NULL);
+            }
+        }
+
+        sa_free(&docs);
+
+        /* Sleep train_tick_seconds */
+        struct timespec ts;
+        ts.tv_sec = (int)CFG.train_tick_seconds;
+        ts.tv_nsec = (long)((CFG.train_tick_seconds - (int)CFG.train_tick_seconds) * 1e9);
+        nanosleep(&ts, NULL);
+    }
+    return NULL;
+}
+
 int main(void) {
     G_arena = arena_new(ARENA_SIZE);
 
@@ -2121,13 +2210,22 @@ int main(void) {
     GPT *model = gpt_new(tok);
     free(doc_ptrs);
 
-    /* Warmup training */
-    if (docs.len > 0) {
-        printf("[trainer] warmup training... (and so it begins)\n");
-        train_steps(model, tok, &docs, CFG.warmup_steps, 1, 1);
-        save_checkpoint(model, tok, NULL);
-        printf("[trainer] warmup complete. base may freeze now, like a proud fossil.\n");
-    }
+    /* Build corpus field for pre-warmup speech */
+    CooccurField *cooccur = cooccur_new(tok->vocab_size);
+    cooccur_build(cooccur, tok, &docs);
+
+    /* Quantum buffer */
+    QuantumBuffer qbuf;
+    qb_init(&qbuf);
+
+    /* Background trainer thread */
+    volatile int warmed_up = 0;
+    TrainerCtx tctx = {
+        .db = db, .model = model, .tok = tok,
+        .qbuf = &qbuf, .warmed_up = &warmed_up, .stop = 0
+    };
+    pthread_t trainer_tid;
+    pthread_create(&trainer_tid, NULL, background_trainer, &tctx);
 
     printf("molecule is alive. Type and press Enter. Ctrl+C to exit.\n\n");
 
@@ -2141,10 +2239,37 @@ int main(void) {
 
         db_add_msg(db, "user", input);
 
-        char *prompt = build_prompt(db, input);
-        arena_reset(&G_arena);
-        char *answer = gpt_generate(model, prompt);
-        free(prompt);
+        /* Feed quantum buffer */
+        qb_feed(&qbuf, input, tok);
+
+        char *answer;
+        if (warmed_up) {
+            /* Use model for generation */
+            char *prompt = build_prompt(db, input);
+            arena_reset(&G_arena);
+            answer = gpt_generate(model, prompt);
+            free(prompt);
+        } else {
+            /* Use corpus field before warmup — the organism speaks before it thinks */
+            IntArr ids = tok_encode(tok, input);
+            int out_ids[256];
+            int out_len = 0;
+            for (int step = 0; step < CFG.corpus_gen_max_tokens && out_len < 255; step++) {
+                int nxt = cooccur_sample_next(cooccur, ids.items, ids.len, CFG.temperature);
+                if (nxt == tok->eos_id && step >= CFG.min_gen_tokens) break;
+                if (nxt == tok->eos_id) continue;
+                out_ids[out_len++] = nxt;
+                ia_push(&ids, nxt);
+            }
+            ia_free(&ids);
+            /* Decode output ids */
+            IntArr dec_ids = {0};
+            ia_push(&dec_ids, tok->bos_id);
+            for (int i = 0; i < out_len; i++) ia_push(&dec_ids, out_ids[i]);
+            ia_push(&dec_ids, tok->eos_id);
+            answer = tok_decode(tok, dec_ids.items, dec_ids.len);
+            ia_free(&dec_ids);
+        }
 
         if (!answer || strlen(answer) == 0) {
             free(answer);
@@ -2153,9 +2278,26 @@ int main(void) {
 
         printf("%s\n", answer);
         db_add_msg(db, "assistant", answer);
+
+        /* Append new text to corpus */
+        StrArr fresh = load_corpus(CFG.corpus_path);
+        char qa_line[1024];
+        snprintf(qa_line, sizeof(qa_line), "H: %.400s A: %.400s", input, answer);
+        sa_push(&fresh, qa_line);
+        if (fresh.len > CFG.max_corpus_lines) {
+            free(fresh.items[0]);
+            memmove(fresh.items, fresh.items + 1, sizeof(char*) * (fresh.len - 1));
+            fresh.len--;
+        }
+        save_corpus(CFG.corpus_path, &fresh);
+        sa_free(&fresh);
+
         free(answer);
     }
 
+    /* Cleanup */
+    tctx.stop = 1;
+    pthread_join(trainer_tid, NULL);
     save_checkpoint(model, tok, NULL);
     sqlite3_close(db);
     arena_destroy(&G_arena);
