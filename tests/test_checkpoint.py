@@ -22,7 +22,10 @@ class TestCheckpointing(unittest.TestCase):
         self.docs = ["Hello world.", "Testing checkpoints.", "Save and load."]
         self.tok = EvolvingTokenizer(self.docs)
         self.model = GPT(self.tok)
-        self.tmp_path = tempfile.mktemp(suffix=".json")
+        # Use NamedTemporaryFile for secure temp file creation
+        self.tmp_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self.tmp_path = self.tmp_file.name
+        self.tmp_file.close()
 
     def tearDown(self):
         if os.path.exists(self.tmp_path):
