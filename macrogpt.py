@@ -12,6 +12,10 @@ A dependency-free, single-file, async, continually-learning GPT organism.
 - Gradually enables BPE *without* invalidating old weights (vocab only EXPANDS)
 - Never forgets by never overwriting learned deltas: it only appends modules
 
+microGPT thinks in scalars.
+macroGPT thinks in vectors.
+Same chain rule, fewer Python objects, more audacity.
+
 In the beginning there was nonames.txt.
 And it was good.
 Mostly.
@@ -73,9 +77,6 @@ class Config:
     temperature: float = 0.85
     top_k: int = 40
     top_p: float = 0.92
-    # sampling extras (more GPT-3/4-ish coherence)
-    min_p: float = 0.06          # drop tokens below min_p * max_prob
-    typical_p: float = 0.95      # typical sampling mass (1.0 disables)
     max_gen_tokens: int = 180
     min_gen_tokens: int = 16
     repetition_guard: int = 4
@@ -153,29 +154,32 @@ def normalize_text(s: str) -> str:
     return " ".join(s.split())
 
 def extract_candidate_sentences_from_messages(msgs):
+    """
+    Turn recent chat into training sentences.
+    Key trick: KEEP the role marker (H:/A:) so the organism learns dialogue,
+    but keep it short so the prompt format doesn't swallow the model.
+    """
     out = []
     for role, text in msgs:
         t = normalize_text(text)
-
-        # strip common dialogue prefixes if they leaked into memory
-        for pref in ("Human:", "AI:", "User:", "Assistant:", "H:", "A:"):
-            if t.startswith(pref):
-                t = t[len(pref):].strip()
-
         if not t:
             continue
+
+        tag = "H:" if role == "user" else "A:"
 
         buf = ""
         for ch in t:
             buf += ch
             if ch in ".!?":
-                if len(buf.strip()) >= 6:
-                    out.append(buf.strip())
+                s = buf.strip()
+                if len(s) >= 6:
+                    out.append(f"{tag} {s}")
                 buf = ""
-        if len(buf.strip()) >= 12:
-            out.append(buf.strip())
+        s = buf.strip()
+        if len(s) >= 12:
+            out.append(f"{tag} {s}")
 
-    # stable dedup
+    # stable dedup (case-insensitive)
     seen = set()
     uniq = []
     for s in out:
@@ -766,82 +770,6 @@ def top_k_top_p_sample(probs, k, p):
             return i
     return idx[-1]
 
-
-def _renorm_probs(probs):
-    s = sum(probs)
-    if s <= 0:
-        return probs
-    return [p / s for p in probs]
-
-def apply_min_p_filter(probs, min_p):
-    """Keep tokens with p >= min_p * max_p, renormalize."""
-    if min_p is None:
-        return probs
-    mp = float(min_p)
-    if mp <= 0:
-        return probs
-    max_p = max(probs) if probs else 0.0
-    if max_p <= 0:
-        return probs
-    thr = mp * max_p
-    out = [p if p >= thr else 0.0 for p in probs]
-    return _renorm_probs(out)
-
-def typical_indices(probs, typical_p):
-    """Return a list of token indices kept by typical sampling (mass typical_p)."""
-    tp = float(typical_p)
-    if tp >= 0.999 or tp <= 0:
-        return list(range(len(probs)))
-    # entropy
-    H = 0.0
-    for p in probs:
-        if p > 0:
-            H -= p * math.log(p + 1e-12)
-    # typicality = |surprisal - entropy|
-    items = []
-    for i, p in enumerate(probs):
-        if p <= 0:
-            continue
-        s = -math.log(p + 1e-12)
-        items.append((abs(s - H), i, p))
-    items.sort(key=lambda x: x[0])  # closer to entropy first
-    kept = []
-    cum = 0.0
-    for _, i, p in items:
-        kept.append(i)
-        cum += p
-        if cum >= tp:
-            break
-    return kept if kept else list(range(len(probs)))
-
-def sample_with_filters(probs, k, p, min_p=None, typical_p=1.0):
-    """Sampling pipeline: min_p -> typical -> top_k/top_p."""
-    probs = apply_min_p_filter(probs, min_p)
-    idx = typical_indices(probs, typical_p)
-    # apply top-k/top-p within idx
-    idx.sort(key=lambda i: probs[i], reverse=True)
-    if k and k > 0:
-        idx = idx[:min(k, len(idx))]
-    if p is not None and float(p) < 1.0:
-        cum = 0.0
-        cut = []
-        for i in idx:
-            cut.append(i)
-            cum += probs[i]
-            if cum >= float(p):
-                break
-        idx = cut
-    mass = sum(probs[i] for i in idx)
-    if mass <= 0:
-        return idx[0] if idx else (len(probs) - 1)
-    r = random.random() * mass
-    s = 0.0
-    for i in idx:
-        s += probs[i]
-        if s >= r:
-            return i
-    return idx[-1]
-
 def clip_params(params, clip):
     # And lo, the gradients shall be clipped, lest they summon Cthulhu.
     if clip <= 0:
@@ -1161,7 +1089,7 @@ class GPT:
             temp = base_temp * t_mul
             scaled = [v / temp for v in raw]
             probs = softmax_probs_float(scaled)
-            nxt = sample_with_filters(probs, CFG.top_k, CFG.top_p, min_p=getattr(CFG,'min_p',0.0), typical_p=getattr(CFG,'typical_p',1.0))
+            nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p)
 
             if nxt == self.tok.stoi[self.tok.EOS]:
                 if step >= CFG.min_gen_tokens:
@@ -1354,22 +1282,28 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
 # ============================================================
 
 def build_prompt_from_memory(con, user_text):
-    # Keep the prompt clean: tags are short and consistent, no meta-instructions.
-    # This reduces the chance that the *prompt format* becomes the model's "language".
-    recent = db_recent_messages(con, limit=12)
+    # Keep the prompt clean and stable.
+    # Goal: teach dialogue, not prompt meta.
+    recent = db_recent_messages(con, limit=14)
 
     def _clip(s, n=260):
         s = normalize_text(s)
         return s[:n].strip()
 
     parts = []
-    for role, text in recent[-10:]:
+    # A tiny anchor so it doesn't drift into "random cough" mode.
+    parts.append("A: (I listen. I answer. I learn.)")
+
+    for role, text in recent[-12:]:
         tag = "H:" if role == "user" else "A:"
         parts.append(f"{tag} {_clip(text)}")
 
     parts.append(f"H: {_clip(user_text)}")
     parts.append("A:")
     return "\n".join(parts)
+
+
+
 
 
 async def chat_main():
