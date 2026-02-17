@@ -1,9 +1,143 @@
-package main
+package tests
 
 import (
 	"math"
+	"math/rand"
+	"sort"
 	"testing"
 )
+
+// SoftmaxProbs computes softmax probabilities from logits.
+// (Copied from molecule.go for testing since Go cannot import main packages)
+func SoftmaxProbs(data []float64) []float64 {
+	maxVal := data[0]
+	for _, v := range data[1:] {
+		if v > maxVal {
+			maxVal = v
+		}
+	}
+	n := len(data)
+	exps := make([]float64, n)
+	total := 0.0
+	for i := 0; i < n; i++ {
+		exps[i] = math.Exp(data[i] - maxVal)
+		total += exps[i]
+	}
+	probs := make([]float64, n)
+	for i := 0; i < n; i++ {
+		probs[i] = exps[i] / total
+	}
+	return probs
+}
+
+// TopKTopPSample samples from probs with top-k, top-p, min-p, and typical-p filtering.
+// (Copied from molecule.go for testing since Go cannot import main packages)
+func TopKTopPSample(probs []float64, k int, p float64, minP float64, typicalP float64) int {
+	n := len(probs)
+	idx := make([]int, n)
+	for i := 0; i < n; i++ {
+		idx[i] = i
+	}
+	sort.Slice(idx, func(a, b int) bool {
+		return probs[idx[a]] > probs[idx[b]]
+	})
+
+	// Top-k filtering
+	if k > 0 && k < len(idx) {
+		idx = idx[:k]
+	}
+
+	// Min-p filtering (GPT-3/4 style): remove tokens with prob < min_p * max_prob
+	if minP > 0.0 && len(idx) > 0 {
+		maxProb := probs[idx[0]]
+		threshold := minP * maxProb
+		filtered := make([]int, 0, len(idx))
+		for _, i := range idx {
+			if probs[i] >= threshold {
+				filtered = append(filtered, i)
+			}
+		}
+		if len(filtered) > 0 {
+			idx = filtered
+		}
+	}
+
+	// Typical-p filtering: prefer tokens with typical information content
+	if typicalP < 1.0 && len(idx) > 0 {
+		// Compute entropy (expected surprisal)
+		entropy := 0.0
+		for _, i := range idx {
+			if probs[i] > 1e-12 {
+				entropy -= probs[i] * math.Log(probs[i])
+			}
+		}
+		// Compute absolute deviation from expected surprisal for each token
+		type devPair struct {
+			idx int
+			dev float64
+		}
+		deviations := make([]devPair, 0, len(idx))
+		for _, i := range idx {
+			if probs[i] > 1e-12 {
+				surprisal := -math.Log(probs[i])
+				deviation := math.Abs(surprisal - entropy)
+				deviations = append(deviations, devPair{i, deviation})
+			}
+		}
+		// Sort by deviation (lower is more typical)
+		sort.Slice(deviations, func(a, b int) bool {
+			return deviations[a].dev < deviations[b].dev
+		})
+		// Keep tokens until cumulative prob >= typical_p
+		cum := 0.0
+		typicalIdx := make([]int, 0, len(deviations))
+		for _, dp := range deviations {
+			typicalIdx = append(typicalIdx, dp.idx)
+			cum += probs[dp.idx]
+			if cum >= typicalP {
+				break
+			}
+		}
+		if len(typicalIdx) > 0 {
+			idx = typicalIdx
+		}
+	}
+
+	// Top-p (nucleus) filtering
+	if p < 1.0 {
+		cum := 0.0
+		cut := make([]int, 0, len(idx))
+		for _, i := range idx {
+			cut = append(cut, i)
+			cum += probs[i]
+			if cum >= p {
+				break
+			}
+		}
+		idx = cut
+	}
+
+	mass := 0.0
+	for _, i := range idx {
+		mass += probs[i]
+	}
+	if mass <= 0 {
+		if len(idx) > 0 {
+			return idx[0]
+		}
+		return n - 1
+	}
+
+	r := rand.Float64() * mass
+	s := 0.0
+	for _, i := range idx {
+		s += probs[i]
+		if s >= r {
+			return i
+		}
+	}
+	return idx[len(idx)-1]
+}
 
 // TestTopKTopPSample tests the basic top-k/top-p sampling.
 func TestTopKTopPSample(t *testing.T) {
