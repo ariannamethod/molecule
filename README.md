@@ -36,20 +36,20 @@ THIS IS:
 
 ---
 
-## What The Actual Is This
+## What Is This
 
-What if instead of `micrograd` scalar ops, we had **vector autograd**?
-What if instead of fixed vocab, we had **evolving BPE**?
-What if instead of "train once, deploy", we had **continuous learning**?
-What if instead of ReLU, we had **SwiGLU**?
-What if instead of sinusoidal positions, we had **RoPE**?
-What if it never forgot? **Delta adapters.**
-What if it could chat? **SQLite memory.**
-What if it had multiple attention mechanisms? **Hybrid heads.**
-What if it grew a personality from scratch? **Native gamma.**
-What if it could speak before training? **Corpus field.**
-What if it was *alive*?
-
+What if instead of `micrograd` scalar ops, we had **vector autograd**?  
+What if instead of fixed vocab, we had **evolving BPE**?  
+What if instead of "train once, deploy", we had **continuous learning**?  
+What if instead of ReLU, we had **SwiGLU**?  
+What if instead of sinusoidal positions, we had **RoPE**?  
+What if it never forgot? **Delta adapters.**  
+What if it could chat? **SQLite memory.**  
+What if it had multiple attention mechanisms? **Hybrid heads.**  
+What if it grew a personality from scratch? **Native gamma.**  
+What if it could speak before training? **Corpus field.**  
+What if it was *alive*?  
+  
 So I built it. **molecule.** Thanks to Karpathy's microgpt, but this is not a fork.
 
 ---
