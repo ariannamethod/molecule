@@ -70,3 +70,4 @@ molecule_bin
 # OS
 .DS_Store
 Thumbs.db
+_codeql_detected_source_root

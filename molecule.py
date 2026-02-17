@@ -73,6 +73,8 @@ class Config:
     temperature: float = 0.85
     top_k: int = 40
     top_p: float = 0.92
+    min_p: float = 0.06         # GPT-3/4 style: filter tokens below min_p * max_prob
+    typical_p: float = 0.95     # Typical sampling: prefer tokens with typical information content
     max_gen_tokens: int = 180
     min_gen_tokens: int = 16
     repetition_guard: int = 4
@@ -425,7 +427,7 @@ def generate_resonant(model, tok, field, prompt_text, use_model=True, model_alph
         else:
             probs = model_probs
 
-        nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p)
+        nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p)
         if nxt == eos_id and step >= CFG.min_gen_tokens:
             break
         if nxt == eos_id:
@@ -951,15 +953,48 @@ def softmax_probs_float(data):
     total = sum(exps)
     return [e / total for e in exps]
 
-def top_k_top_p_sample(probs, k, p):
+def top_k_top_p_sample(probs, k, p, min_p=0.0, typical_p=1.0):
     # And lo, sampling shall not be a coin flip but a controlled hallucination.
     n = len(probs)
     idx = list(range(n))
     idx.sort(key=lambda i: probs[i], reverse=True)
 
+    # Top-k filtering
     if k > 0:
         idx = idx[:min(k, len(idx))]
 
+    # Min-p filtering (GPT-3/4 style): remove tokens with prob < min_p * max_prob
+    if min_p > 0.0 and idx:
+        max_prob = probs[idx[0]]
+        threshold = min_p * max_prob
+        idx = [i for i in idx if probs[i] >= threshold]
+
+    # Typical-p filtering: prefer tokens with typical information content
+    # (i.e., tokens whose surprisal is close to the expected surprisal)
+    if typical_p < 1.0 and idx:
+        # Compute entropy (expected surprisal)
+        entropy = -sum(probs[i] * math.log(probs[i]) for i in idx if probs[i] > 1e-12)
+        # Compute absolute deviation from expected surprisal for each token
+        deviations = []
+        for i in idx:
+            if probs[i] > 1e-12:
+                surprisal = -math.log(probs[i])
+                deviation = abs(surprisal - entropy)
+                deviations.append((i, deviation))
+        # Sort by deviation (lower is more typical)
+        deviations.sort(key=lambda x: x[1])
+        # Keep tokens until cumulative prob >= typical_p
+        cum = 0.0
+        typical_idx = []
+        for i, _ in deviations:
+            typical_idx.append(i)
+            cum += probs[i]
+            if cum >= typical_p:
+                break
+        if typical_idx:
+            idx = typical_idx
+
+    # Top-p (nucleus) filtering
     if p < 1.0:
         cum = 0.0
         cut = []
@@ -1390,7 +1425,7 @@ class GPT:
             temp = base_temp * t_mul
             scaled = [v / temp for v in raw]
             probs = softmax_probs_float(scaled)
-            nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p)
+            nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p)
 
             if nxt == self.tok.stoi[self.tok.EOS]:
                 if step >= CFG.min_gen_tokens:

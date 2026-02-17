@@ -64,6 +64,8 @@ type Config struct {
 	Temperature    float64 `json:"temperature"`
 	TopK           int     `json:"top_k"`
 	TopP           float64 `json:"top_p"`
+	MinP           float64 `json:"min_p"`     // GPT-3/4 style: filter tokens below min_p * max_prob
+	TypicalP       float64 `json:"typical_p"` // Typical sampling: prefer tokens with typical information content
 	MaxGenTokens   int     `json:"max_gen_tokens"`
 	MinGenTokens   int     `json:"min_gen_tokens"`
 	RepetitionGuard int    `json:"repetition_guard"`
@@ -124,6 +126,8 @@ var CFG = Config{
 	Temperature:          0.85,
 	TopK:                 40,
 	TopP:                 0.92,
+	MinP:                 0.06,
+	TypicalP:             0.95,
 	MaxGenTokens:         180,
 	MinGenTokens:         16,
 	RepetitionGuard:      4,
@@ -741,9 +745,9 @@ func SoftmaxProbs(data []float64) []float64 {
 	return probs
 }
 
-// TopKTopPSample samples from probs with top-k and top-p filtering.
+// TopKTopPSample samples from probs with top-k, top-p, min-p, and typical-p filtering.
 // And lo, sampling shall not be a coin flip but a controlled hallucination.
-func TopKTopPSample(probs []float64, k int, p float64) int {
+func TopKTopPSample(probs []float64, k int, p float64, minP float64, typicalP float64) int {
 	n := len(probs)
 	idx := make([]int, n)
 	for i := 0; i < n; i++ {
@@ -753,10 +757,68 @@ func TopKTopPSample(probs []float64, k int, p float64) int {
 		return probs[idx[a]] > probs[idx[b]]
 	})
 
+	// Top-k filtering
 	if k > 0 && k < len(idx) {
 		idx = idx[:k]
 	}
 
+	// Min-p filtering (GPT-3/4 style): remove tokens with prob < min_p * max_prob
+	if minP > 0.0 && len(idx) > 0 {
+		maxProb := probs[idx[0]]
+		threshold := minP * maxProb
+		filtered := make([]int, 0, len(idx))
+		for _, i := range idx {
+			if probs[i] >= threshold {
+				filtered = append(filtered, i)
+			}
+		}
+		if len(filtered) > 0 {
+			idx = filtered
+		}
+	}
+
+	// Typical-p filtering: prefer tokens with typical information content
+	if typicalP < 1.0 && len(idx) > 0 {
+		// Compute entropy (expected surprisal)
+		entropy := 0.0
+		for _, i := range idx {
+			if probs[i] > 1e-12 {
+				entropy -= probs[i] * math.Log(probs[i])
+			}
+		}
+		// Compute absolute deviation from expected surprisal for each token
+		type devPair struct {
+			idx int
+			dev float64
+		}
+		deviations := make([]devPair, 0, len(idx))
+		for _, i := range idx {
+			if probs[i] > 1e-12 {
+				surprisal := -math.Log(probs[i])
+				deviation := math.Abs(surprisal - entropy)
+				deviations = append(deviations, devPair{i, deviation})
+			}
+		}
+		// Sort by deviation (lower is more typical)
+		sort.Slice(deviations, func(a, b int) bool {
+			return deviations[a].dev < deviations[b].dev
+		})
+		// Keep tokens until cumulative prob >= typical_p
+		cum := 0.0
+		typicalIdx := make([]int, 0, len(deviations))
+		for _, dp := range deviations {
+			typicalIdx = append(typicalIdx, dp.idx)
+			cum += probs[dp.idx]
+			if cum >= typicalP {
+				break
+			}
+		}
+		if len(typicalIdx) > 0 {
+			idx = typicalIdx
+		}
+	}
+
+	// Top-p (nucleus) filtering
 	if p < 1.0 {
 		cum := 0.0
 		cut := make([]int, 0, len(idx))
@@ -1686,7 +1748,7 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 			scaled[i] = v / temp
 		}
 		probs := SoftmaxProbs(scaled)
-		nxt := TopKTopPSample(probs, CFG.TopK, CFG.TopP)
+		nxt := TopKTopPSample(probs, CFG.TopK, CFG.TopP, CFG.MinP, CFG.TypicalP)
 
 		if nxt == eosID {
 			if step >= CFG.MinGenTokens {
@@ -2493,6 +2555,7 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 			for k, v := range field.Trigram {
 				if k[0] == a && k[1] == b && int(k[2]) < tok.VocabSize {
 					corpusCounts[k[2]] += v
+					corpusTotal += v // And lo, the trigram shall be counted properly
 				}
 			}
 		}
@@ -2526,7 +2589,7 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		for i := 0; i < tok.VocabSize && i < len(modelProbs); i++ {
 			blended[i] = modelAlpha*modelProbs[i] + (1.0-modelAlpha)*corpusProbs[i]
 		}
-		nxt := TopKTopPSample(blended, CFG.TopK, CFG.TopP)
+		nxt := TopKTopPSample(blended, CFG.TopK, CFG.TopP, CFG.MinP, CFG.TypicalP)
 
 		if nxt == eosID && step >= CFG.MinGenTokens {
 			break
@@ -2743,7 +2806,7 @@ func main() {
 	stop := make(chan struct{})
 	go backgroundTrainer(db, model, tok, qbuf, stop)
 
-	fmt.Println("molecule is alive. Type and press Enter. Ctrl+C to exit.\n")
+	fmt.Println("molecule is alive. Type and press Enter. Ctrl+C to exit.")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {

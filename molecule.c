@@ -49,6 +49,8 @@ typedef struct {
     double temperature;
     int top_k;
     double top_p;
+    double min_p;           /* GPT-3/4 style: filter tokens below min_p * max_prob */
+    double typical_p;       /* Typical sampling: prefer tokens with typical information content */
     int max_gen_tokens;
     int min_gen_tokens;
     int repetition_guard;
@@ -104,6 +106,8 @@ static Config CFG = {
     .temperature = 0.85,
     .top_k = 40,
     .top_p = 0.92,
+    .min_p = 0.06,
+    .typical_p = 0.95,
     .max_gen_tokens = 180,
     .min_gen_tokens = 16,
     .repetition_guard = 4,
@@ -815,8 +819,9 @@ static void softmax_probs(const double *data, int n, double *out) {
     for (int i = 0; i < n; i++) out[i] /= sum;
 }
 
-/* Top-k/top-p sampling */
-static int top_k_top_p_sample(const double *probs, int n, int k, double p) {
+/* Top-k/top-p/min-p/typical-p sampling */
+/* And lo, sampling shall not be a coin flip but a controlled hallucination. */
+static int top_k_top_p_sample(const double *probs, int n, int k, double p, double min_p, double typical_p) {
     int *idx = malloc(sizeof(int) * n);
     for (int i = 0; i < n; i++) idx[i] = i;
     /* Sort descending by prob */
@@ -827,6 +832,61 @@ static int top_k_top_p_sample(const double *probs, int n, int k, double p) {
     int len = n;
     if (k > 0 && k < len) len = k;
 
+    /* Min-p filtering (GPT-3/4 style): remove tokens with prob < min_p * max_prob */
+    if (min_p > 0.0 && len > 0) {
+        double max_prob = probs[idx[0]];
+        double threshold = min_p * max_prob;
+        int new_len = 0;
+        for (int i = 0; i < len; i++) {
+            if (probs[idx[i]] >= threshold) {
+                idx[new_len++] = idx[i];
+            }
+        }
+        if (new_len > 0) len = new_len;
+    }
+
+    /* Typical-p filtering: prefer tokens with typical information content */
+    if (typical_p < 1.0 && len > 0) {
+        /* Compute entropy (expected surprisal) */
+        double entropy = 0.0;
+        for (int i = 0; i < len; i++) {
+            if (probs[idx[i]] > 1e-12) {
+                entropy -= probs[idx[i]] * log(probs[idx[i]]);
+            }
+        }
+        /* Compute absolute deviation from expected surprisal for each token */
+        double *deviations = malloc(sizeof(double) * len);
+        int *dev_idx = malloc(sizeof(int) * len);
+        int dev_count = 0;
+        for (int i = 0; i < len; i++) {
+            if (probs[idx[i]] > 1e-12) {
+                double surprisal = -log(probs[idx[i]]);
+                deviations[dev_count] = fabs(surprisal - entropy);
+                dev_idx[dev_count] = idx[i];
+                dev_count++;
+            }
+        }
+        /* Sort by deviation (lower is more typical) */
+        for (int i = 0; i < dev_count - 1; i++)
+            for (int j = i + 1; j < dev_count; j++)
+                if (deviations[j] < deviations[i]) {
+                    double td = deviations[i]; deviations[i] = deviations[j]; deviations[j] = td;
+                    int ti = dev_idx[i]; dev_idx[i] = dev_idx[j]; dev_idx[j] = ti;
+                }
+        /* Keep tokens until cumulative prob >= typical_p */
+        double cum = 0.0;
+        int typical_len = 0;
+        for (int i = 0; i < dev_count; i++) {
+            idx[typical_len++] = dev_idx[i];
+            cum += probs[dev_idx[i]];
+            if (cum >= typical_p) break;
+        }
+        if (typical_len > 0) len = typical_len;
+        free(deviations);
+        free(dev_idx);
+    }
+
+    /* Top-p (nucleus) filtering */
     if (p < 1.0) {
         double cum = 0;
         for (int i = 0; i < len; i++) {
@@ -1501,7 +1561,7 @@ static char *gpt_generate(GPT *g, const char *prompt) {
         for (int i = 0; i < V; i++) scaled[i] = logits->data[i] / temp;
         softmax_probs(scaled, V, probs_buf);
 
-        int nxt = top_k_top_p_sample(probs_buf, V, CFG.top_k, CFG.top_p);
+        int nxt = top_k_top_p_sample(probs_buf, V, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p);
         free(scaled);
 
         if (nxt == g->tok->eos_id) {
