@@ -1306,8 +1306,9 @@ async def chat_main():
     con = init_db(CFG.db_path)
 
     if not os.path.exists(CFG.corpus_path):
-        # And lo, the seed corpus shall be written, humble and slightly ominous.
-        save_corpus_lines(CFG.corpus_path, ["Hello.", "I exist.", "Speak."])
+        print(f"Seed corpus not found: {CFG.corpus_path}")
+        print("Place nonames.txt alongside molecule.py to begin.")
+        return
 
     docs = load_corpus_lines(CFG.corpus_path)
 
