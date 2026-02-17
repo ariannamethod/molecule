@@ -12,10 +12,6 @@ A dependency-free, single-file, async, continually-learning GPT organism.
 - Gradually enables BPE *without* invalidating old weights (vocab only EXPANDS)
 - Never forgets by never overwriting learned deltas: it only appends modules
 
-microGPT thinks in scalars.
-macroGPT thinks in vectors.
-Same chain rule, fewer Python objects, more audacity.
-
 In the beginning there was nonames.txt.
 And it was good.
 Mostly.
