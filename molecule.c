@@ -89,6 +89,14 @@ typedef struct {
     int qb_min_bytes;
     double qb_min_novelty;
     double qb_cooldown_seconds;
+
+    /* syntropy tracker (mathematical self-awareness) */
+    int syntropy_window;              /* rolling window for syntropy trend */
+    double field_deviation_ceiling;   /* KL divergence above this = drifted too far */
+    double field_deviation_floor;     /* below this = not learning, just parroting */
+    double syntropy_lr_boost;         /* boost LR when syntropy is rising */
+    double syntropy_lr_dampen;        /* dampen LR when syntropy is falling */
+    double syntropy_delta_grow_boost; /* higher delta grow prob when syntropy is good */
 } Config;
 
 static Config CFG = {
@@ -137,6 +145,12 @@ static Config CFG = {
     .qb_min_bytes = 1024,
     .qb_min_novelty = 0.15,
     .qb_cooldown_seconds = 60.0,
+    .syntropy_window = 8,
+    .field_deviation_ceiling = 12.0,
+    .field_deviation_floor = 0.1,
+    .syntropy_lr_boost = 1.3,
+    .syntropy_lr_dampen = 0.6,
+    .syntropy_delta_grow_boost = 0.15,
 };
 
 /* ============================================================
@@ -1980,6 +1994,18 @@ static sqlite3 *init_db(const char *path) {
                      "n_deltas INTEGER NOT NULL, corpus_chars INTEGER NOT NULL,"
                      "loss REAL, gamma_sparsity REAL, gamma_magnitude REAL,"
                      "note TEXT)", NULL, NULL, NULL);
+    /* And lo, the organism shall track not just what it is, but where it is going. */
+    sqlite3_exec(db, "CREATE TABLE IF NOT EXISTS syntropy_log("
+                     "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                     "ts REAL NOT NULL,"
+                     "entropy_before REAL,"
+                     "entropy_after REAL,"
+                     "syntropy_delta REAL,"
+                     "field_deviation REAL,"
+                     "purpose_magnitude REAL,"
+                     "purpose_alignment REAL,"
+                     "action_taken TEXT,"
+                     "note TEXT)", NULL, NULL, NULL);
     return db;
 }
 
@@ -2391,6 +2417,407 @@ static void update_reservoir_corpus(sqlite3 *db, const char *corpus_path, int ma
 }
 
 /* ============================================================
+ * 8e) SYNTROPY — mathematical self-reasoning engine
+ * ============================================================ */
+/* And lo, the organism shall not merely observe its own reflection,
+ * but reason about the direction of its becoming.
+ * Gamma is memory. Purpose is intention. Syntropy is the arrow. */
+
+/* compute_field_deviation: KL divergence between model logits and corpus co-occurrence field.
+ * Measures how far the learned model has drifted from raw corpus physics.
+ * Low = parroting the field. High = hallucinating beyond it.
+ * The sweet spot is in between: learning, not lying. */
+static double gpt_compute_field_deviation(GPT *g, EvolvingTokenizer *tok,
+                                          CooccurField *field, StrArr *docs,
+                                          int sample_n) {
+    if (docs->len == 0 || !field->built) return 0.0;
+
+    double kl_sum = 0.0;
+    int count = 0;
+    int n_sample = sample_n < docs->len ? sample_n : docs->len;
+
+    int prev_grad = grad_enabled;
+    grad_enabled = 0;
+
+    for (int s = 0; s < n_sample; s++) {
+        int doc_idx = rand_int(docs->len);
+        IntArr ids = tok_encode(tok, docs->items[doc_idx]);
+        if (ids.len < 3) { ia_free(&ids); continue; }
+
+        KVCache *kv = kv_new(g->n_layer, g->block_size + 1);
+        int limit = ids.len - 1;
+        if (limit > g->block_size) limit = g->block_size;
+
+        for (int pos = 0; pos < limit; pos++) {
+            arena_reset(&G_arena);
+            Node *logits = gpt_forward_step(g, ids.items[pos], pos, kv);
+            int V = logits->len;
+
+            /* model distribution */
+            double max_val = logits->data[0];
+            for (int i = 1; i < V; i++) if (logits->data[i] > max_val) max_val = logits->data[i];
+            double *model_probs = malloc(sizeof(double) * V);
+            double exp_sum = 0;
+            for (int i = 0; i < V; i++) {
+                model_probs[i] = exp(logits->data[i] - max_val);
+                exp_sum += model_probs[i];
+            }
+            for (int i = 0; i < V; i++) model_probs[i] /= exp_sum;
+
+            /* corpus field distribution for this context (trigram or unigram fallback) */
+            double *field_probs = calloc(V, sizeof(double));
+            int found_field = 0;
+
+            /* Try trigram context */
+            if (pos >= 1) {
+                int a = ids.items[pos - 1], b = ids.items[pos];
+                for (int t = 0; t < field->n_trigrams; t++) {
+                    if (field->trigrams[t].key[0] == a && field->trigrams[t].key[1] == b) {
+                        int c = field->trigrams[t].key[2];
+                        if (c < V) { field_probs[c] += field->trigrams[t].count; found_field = 1; }
+                    }
+                }
+            }
+
+            /* Fallback: unigram */
+            if (!found_field) {
+                double uni_sum = 0;
+                for (int i = 0; i < V && i < field->vocab_size; i++) uni_sum += field->unigram[i];
+                if (uni_sum > 1e-10) {
+                    for (int i = 0; i < V && i < field->vocab_size; i++)
+                        field_probs[i] = field->unigram[i] / uni_sum;
+                    found_field = 1;
+                }
+            }
+
+            /* Normalize field probs */
+            if (found_field) {
+                double fp_sum = 0;
+                for (int i = 0; i < V; i++) fp_sum += field_probs[i];
+                if (fp_sum > 1e-10) {
+                    for (int i = 0; i < V; i++) field_probs[i] /= fp_sum;
+
+                    /* KL(model || field) — how much model diverges from field */
+                    double kl = 0;
+                    for (int i = 0; i < V; i++) {
+                        if (model_probs[i] > 1e-12 && field_probs[i] > 1e-12)
+                            kl += model_probs[i] * log(model_probs[i] / field_probs[i]);
+                    }
+                    kl_sum += kl;
+                    count++;
+                }
+            }
+
+            free(model_probs);
+            free(field_probs);
+        }
+
+        /* Free KV cache */
+        for (int i = 0; i < kv->n_layers; i++) { free(kv->layers[i].keys); free(kv->layers[i].values); }
+        free(kv->layers); free(kv);
+        ia_free(&ids);
+    }
+
+    grad_enabled = prev_grad;
+    return count > 0 ? kl_sum / count : 0.0;
+}
+
+/* compute_model_entropy: average entropy of model predictions on corpus samples.
+ * Falling entropy = rising order = syntropy in action. */
+static double gpt_compute_model_entropy(GPT *g, EvolvingTokenizer *tok,
+                                        StrArr *docs, int sample_n) {
+    if (docs->len == 0) return 0.0;
+
+    double entropy_sum = 0.0;
+    int count = 0;
+    int n_sample = sample_n < docs->len ? sample_n : docs->len;
+
+    int prev_grad = grad_enabled;
+    grad_enabled = 0;
+
+    for (int s = 0; s < n_sample; s++) {
+        int doc_idx = rand_int(docs->len);
+        IntArr ids = tok_encode(tok, docs->items[doc_idx]);
+        if (ids.len < 3) { ia_free(&ids); continue; }
+
+        KVCache *kv = kv_new(g->n_layer, g->block_size + 1);
+        int limit = ids.len - 1;
+        if (limit > g->block_size) limit = g->block_size;
+
+        for (int pos = 0; pos < limit; pos++) {
+            arena_reset(&G_arena);
+            Node *logits = gpt_forward_step(g, ids.items[pos], pos, kv);
+            int V = logits->len;
+
+            /* softmax -> entropy */
+            double max_val = logits->data[0];
+            for (int i = 1; i < V; i++) if (logits->data[i] > max_val) max_val = logits->data[i];
+            double *probs = malloc(sizeof(double) * V);
+            double exp_sum = 0;
+            for (int i = 0; i < V; i++) {
+                probs[i] = exp(logits->data[i] - max_val);
+                exp_sum += probs[i];
+            }
+            for (int i = 0; i < V; i++) probs[i] /= exp_sum;
+
+            double ent = 0;
+            for (int i = 0; i < V; i++)
+                if (probs[i] > 1e-12) ent -= probs[i] * log(probs[i]);
+            entropy_sum += ent;
+            count++;
+
+            free(probs);
+        }
+
+        for (int i = 0; i < kv->n_layers; i++) { free(kv->layers[i].keys); free(kv->layers[i].values); }
+        free(kv->layers); free(kv);
+        ia_free(&ids);
+    }
+
+    grad_enabled = prev_grad;
+    return count > 0 ? entropy_sum / count : 0.0;
+}
+
+/* compute_purpose_vector: direction of weight movement in the last delta layer.
+ * Unlike gamma (which is cumulative drift from birth),
+ * purpose captures the direction of the most recent change.
+ * Gamma is 'who I became'. Purpose is 'where I am going'. */
+static double *gpt_compute_purpose_vector(GPT *g, int *out_dim, double *out_mag) {
+    *out_dim = 0;
+    *out_mag = 0.0;
+    if (g->n_deltas == 0) return NULL;
+
+    DeltaModule *last = g->deltas[g->n_deltas - 1];
+    if (last->count == 0) return NULL;
+
+    /* Aggregate delta A matrices as the purpose signal.
+     * And lo, the direction of the last delta's A rows shall speak
+     * of where the organism intends to go next. */
+    int dim = 0;
+    int n_rows = 0;
+
+    /* Find dimension from first adapter's A matrix */
+    for (int a = 0; a < last->count; a++) {
+        DeltaAdapter *da = last->adapters[a];
+        if (da->A->nin > dim) dim = da->A->nin;
+    }
+    if (dim == 0) return NULL;
+
+    double *mean_dir = calloc(dim, sizeof(double));
+
+    for (int a = 0; a < last->count; a++) {
+        DeltaAdapter *da = last->adapters[a];
+        int d = da->A->nin < dim ? da->A->nin : dim;
+        for (int r = 0; r < da->A->nout; r++) {
+            for (int j = 0; j < d; j++)
+                mean_dir[j] += da->A->row_data[r][j];
+            n_rows++;
+        }
+    }
+
+    if (n_rows > 0) {
+        for (int j = 0; j < dim; j++) mean_dir[j] /= (double)n_rows;
+    }
+
+    double mag = 0;
+    for (int j = 0; j < dim; j++) mag += mean_dir[j] * mean_dir[j];
+    mag = sqrt(mag);
+    *out_mag = mag;
+    *out_dim = dim;
+
+    if (mag > 1e-10) {
+        for (int j = 0; j < dim; j++) mean_dir[j] /= mag;
+    }
+
+    return mean_dir;
+}
+
+/* purpose_gamma_alignment: cosine similarity between purpose vector and gamma direction.
+ * High alignment = learning reinforces identity (syntropy).
+ * Low alignment = learning diverges from identity (entropy).
+ * Negative = learning opposes identity (danger). */
+static double gpt_purpose_gamma_alignment(GPT *g) {
+    int gamma_dim; double gamma_mag;
+    double *gamma_dir = gpt_contrastive_projection(g, &gamma_dim, &gamma_mag);
+
+    int purpose_dim; double purpose_mag;
+    double *purpose_dir = gpt_compute_purpose_vector(g, &purpose_dim, &purpose_mag);
+
+    if (!gamma_dir || !purpose_dir) {
+        free(gamma_dir); free(purpose_dir);
+        return 0.0;
+    }
+    if (gamma_mag < CFG.gamma_min_magnitude || purpose_mag < 1e-10) {
+        free(gamma_dir); free(purpose_dir);
+        return 0.0;
+    }
+
+    /* Ensure same dimensionality (purpose might be different dim) */
+    int min_dim = gamma_dim < purpose_dim ? gamma_dim : purpose_dim;
+    if (min_dim == 0) {
+        free(gamma_dir); free(purpose_dir);
+        return 0.0;
+    }
+
+    double dot = 0;
+    for (int i = 0; i < min_dim; i++) dot += gamma_dir[i] * purpose_dir[i];
+
+    free(gamma_dir);
+    free(purpose_dir);
+    return dot;
+}
+
+/* ============================================================
+ * 8f) SYNTROPY TRACKER — the arrow that points toward coherence
+ * ============================================================ */
+/* And lo, the organism shall not merely track its changes,
+ * but reason mathematically about whether it is becoming more itself.
+ * This is where tracking becomes reasoning, and reasoning becomes action. */
+
+#define SYNTROPY_MAX_HISTORY 64
+
+typedef struct {
+    double entropy_history[SYNTROPY_MAX_HISTORY]; /* rolling window of model entropy */
+    int history_len;
+    double syntropy_trend;    /* positive = organizing, negative = dissolving */
+    double field_deviation;   /* how far from corpus physics */
+    double purpose_magnitude; /* strength of current learning direction */
+    double purpose_alignment; /* cosine(purpose, gamma) */
+    const char *last_action;  /* what was decided last time */
+} SyntropyTracker;
+
+static void syntropy_init(SyntropyTracker *st) {
+    memset(st, 0, sizeof(SyntropyTracker));
+    st->last_action = "none";
+}
+
+/* Take all measurements. This is the organism looking at itself
+ * through mathematical instruments. And lo, it shall measure the
+ * angle between its trajectory and its identity. */
+static double syntropy_measure(SyntropyTracker *st, GPT *g, EvolvingTokenizer *tok,
+                               CooccurField *field, StrArr *docs) {
+    double entropy_now = gpt_compute_model_entropy(g, tok, docs, 16);
+
+    /* Append to rolling window */
+    if (st->history_len < SYNTROPY_MAX_HISTORY) {
+        st->entropy_history[st->history_len++] = entropy_now;
+    } else {
+        /* Shift left, drop oldest */
+        memmove(st->entropy_history, st->entropy_history + 1,
+                sizeof(double) * (SYNTROPY_MAX_HISTORY - 1));
+        st->entropy_history[SYNTROPY_MAX_HISTORY - 1] = entropy_now;
+    }
+
+    /* Trim to syntropy_window */
+    if (st->history_len > CFG.syntropy_window) {
+        int excess = st->history_len - CFG.syntropy_window;
+        memmove(st->entropy_history, st->entropy_history + excess,
+                sizeof(double) * CFG.syntropy_window);
+        st->history_len = CFG.syntropy_window;
+    }
+
+    /* syntropy = negative entropy trend (entropy going down = syntropy going up) */
+    if (st->history_len >= 2) {
+        int recent_half = st->history_len / 2;
+        double old_mean = 0, new_mean = 0;
+        for (int i = 0; i < recent_half; i++) old_mean += st->entropy_history[i];
+        old_mean /= (double)recent_half;
+        for (int i = recent_half; i < st->history_len; i++) new_mean += st->entropy_history[i];
+        new_mean /= (double)(st->history_len - recent_half);
+        st->syntropy_trend = old_mean - new_mean; /* positive = good */
+    } else {
+        st->syntropy_trend = 0.0;
+    }
+
+    st->field_deviation = gpt_compute_field_deviation(g, tok, field, docs, 32);
+
+    int purpose_dim; double purpose_mag;
+    double *pv = gpt_compute_purpose_vector(g, &purpose_dim, &purpose_mag);
+    free(pv);
+    st->purpose_magnitude = purpose_mag;
+
+    st->purpose_alignment = gpt_purpose_gamma_alignment(g);
+
+    return entropy_now;
+}
+
+/* Mathematical self-reasoning: decide how to adjust learning.
+ * The organism does not just observe — it steers.
+ * And lo, the arrow of syntropy shall guide the hand of the optimizer. */
+typedef struct {
+    double lr_multiplier;
+    double delta_grow_override; /* negative = no override */
+    const char *action;
+} SyntropyDecision;
+
+static SyntropyDecision syntropy_decide_action(SyntropyTracker *st) {
+    SyntropyDecision d;
+    d.lr_multiplier = 1.0;
+    d.delta_grow_override = -1.0; /* sentinel: no override */
+    d.action = "steady";
+
+    /* CASE 1: Syntropy rising + field deviation in sweet spot = thriving */
+    if (st->syntropy_trend > 0.01 &&
+        st->field_deviation > CFG.field_deviation_floor &&
+        st->field_deviation < CFG.field_deviation_ceiling) {
+        d.lr_multiplier = CFG.syntropy_lr_boost;
+        if (st->purpose_alignment > 0.3) {
+            d.delta_grow_override = CFG.syntropy_delta_grow_boost;
+            d.action = "amplify";  /* everything aligned, push harder */
+        } else {
+            d.action = "boost";    /* syntropy good but purpose drifting, boost gently */
+        }
+    }
+    /* CASE 2: Syntropy falling = dissolving, slow down */
+    else if (st->syntropy_trend < -0.01) {
+        d.lr_multiplier = CFG.syntropy_lr_dampen;
+        d.action = "dampen";       /* losing order, reduce learning rate */
+    }
+    /* CASE 3: Field deviation too high = hallucinating */
+    else if (st->field_deviation > CFG.field_deviation_ceiling) {
+        d.lr_multiplier = CFG.syntropy_lr_dampen;
+        d.action = "ground";       /* too far from corpus, pull back */
+    }
+    /* CASE 4: Field deviation too low = parroting */
+    else if (st->field_deviation < CFG.field_deviation_floor) {
+        d.lr_multiplier = CFG.syntropy_lr_boost;
+        d.action = "explore";      /* too close to corpus, push out */
+    }
+
+    /* CASE 5: Purpose opposes gamma = identity crisis */
+    if (st->purpose_alignment < -0.3) {
+        d.lr_multiplier *= 0.5;
+        d.action = "realign";      /* learning against identity, slow down hard */
+    }
+
+    st->last_action = d.action;
+    return d;
+}
+
+/* Write the mathematical conclusion to the syntropy log.
+ * And lo, every act of self-measurement shall be recorded in stone. */
+static void syntropy_log_to_db(SyntropyTracker *st, sqlite3 *db,
+                                double entropy_before, double entropy_after,
+                                const char *action) {
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(db,
+        "INSERT INTO syntropy_log(ts, entropy_before, entropy_after, syntropy_delta, "
+        "field_deviation, purpose_magnitude, purpose_alignment, action_taken, note) "
+        "VALUES(?,?,?,?,?,?,?,?,?)", -1, &stmt, NULL);
+    sqlite3_bind_double(stmt, 1, (double)time(NULL));
+    sqlite3_bind_double(stmt, 2, entropy_before);
+    sqlite3_bind_double(stmt, 3, entropy_after);
+    sqlite3_bind_double(stmt, 4, st->syntropy_trend);
+    sqlite3_bind_double(stmt, 5, st->field_deviation);
+    sqlite3_bind_double(stmt, 6, st->purpose_magnitude);
+    sqlite3_bind_double(stmt, 7, st->purpose_alignment);
+    sqlite3_bind_text(stmt, 8, action, -1, SQLITE_STATIC);
+    sqlite3_bind_null(stmt, 9);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+/* ============================================================
  * 9) TRAINING
  * ============================================================ */
 
@@ -2537,17 +2964,26 @@ typedef struct {
     GPT *model;
     EvolvingTokenizer *tok;
     QuantumBuffer *qbuf;
+    CooccurField *field;
+    SyntropyTracker syntracker;
     volatile int *warmed_up;
     volatile int stop;
 } TrainerCtx;
 
 static void *background_trainer(void *arg) {
-    /* And lo, asynchronous training shall occur, because sleeping is for humans. */
+    /* And lo, asynchronous training shall occur, because sleeping is for humans.
+     * And the syntropy tracker shall ride alongside, measuring the angle
+     * between becoming and being. */
     TrainerCtx *ctx = (TrainerCtx *)arg;
 
     while (!ctx->stop) {
         update_reservoir_corpus(ctx->db, CFG.corpus_path, CFG.max_corpus_lines);
         StrArr docs = load_corpus(CFG.corpus_path);
+
+        /* Rebuild field from current corpus (the organism re-reads its own physics) */
+        if (docs.len > 0 && ctx->field) {
+            cooccur_build(ctx->field, ctx->tok, &docs);
+        }
 
         /* Tokenizer evolution (char -> BPE enablement) + safe vocab expansion */
         if (docs.len > 0) {
@@ -2574,18 +3010,44 @@ static void *background_trainer(void *arg) {
         if (*ctx->warmed_up && qb_should_trigger(ctx->qbuf) && docs.len > 0) {
             int snap_bytes; double snap_novelty;
             qb_snapshot(ctx->qbuf, &snap_bytes, &snap_novelty);
-            printf("[trainer] micro-train burst (%d bytes, novelty %.2f) — and lo, it feeds again.\n",
+            printf("[trainer] quantum burst (bytes=%d, novelty=%.3f)\n",
                    snap_bytes, snap_novelty);
+
+            /* SYNTROPY: measure before burst.
+             * And lo, the organism shall look upon itself before it changes,
+             * that it may know whether the change was righteous. */
+            double entropy_before;
+            SyntropyDecision decision;
+            pthread_mutex_lock(&ctx->model->mu);
+            entropy_before = syntropy_measure(&ctx->syntracker, ctx->model,
+                                              ctx->tok, ctx->field, &docs);
+            /* SYNTROPY: decide how to learn (mathematical self-reasoning) */
+            decision = syntropy_decide_action(&ctx->syntracker);
+            printf("[syntropy] action=%s | trend=%.4f | field_dev=%.3f "
+                   "| purpose_align=%.3f | lr_mul=%.2f\n",
+                   decision.action, ctx->syntracker.syntropy_trend,
+                   ctx->syntracker.field_deviation,
+                   ctx->syntracker.purpose_alignment,
+                   decision.lr_multiplier);
 
             /* IMMUNE SYSTEM: snapshot before burst */
             int pre_dim; double pre_mag;
             double *pre_direction = gpt_contrastive_projection(ctx->model, &pre_dim, &pre_mag);
             ImmuneSnapshot delta_snap = gpt_snapshot_deltas(ctx->model);
+            pthread_mutex_unlock(&ctx->model->mu);
+
+            /* Apply syntropy-adjusted learning rate.
+             * And lo, the learning rate shall bend to the will of syntropy. */
+            double original_lr = CFG.learning_rate;
+            CFG.learning_rate = original_lr * decision.lr_multiplier;
 
             int train_base = !CFG.freeze_base_after_warmup;
             train_steps(ctx->model, ctx->tok, &docs, CFG.micro_steps, train_base, 1);
 
+            CFG.learning_rate = original_lr; /* restore */
+
             /* IMMUNE SYSTEM: check drift after burst */
+            pthread_mutex_lock(&ctx->model->mu);
             int post_dim; double post_mag;
             double *post_direction = gpt_contrastive_projection(ctx->model, &post_dim, &post_mag);
             double drift_cos = gpt_drift_check(pre_direction, pre_mag, post_direction, post_mag, pre_dim);
@@ -2593,16 +3055,32 @@ static void *background_trainer(void *arg) {
                 printf("[immune] NOISE DETECTED (drift cosine=%.3f). Rolling back deltas.\n", drift_cos);
                 gpt_restore_deltas(ctx->model, &delta_snap);
                 db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "noise_rejected");
+                syntropy_log_to_db(&ctx->syntracker, ctx->db,
+                                   entropy_before, entropy_before, "noise_rejected");
             } else {
+                /* SYNTROPY: measure after burst */
+                double entropy_after = syntropy_measure(&ctx->syntracker, ctx->model,
+                                                        ctx->tok, ctx->field, &docs);
+                syntropy_log_to_db(&ctx->syntracker, ctx->db,
+                                   entropy_before, entropy_after, decision.action);
                 save_checkpoint(ctx->model, ctx->tok, NULL);
-                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "micro_burst");
+                char note_buf[128];
+                snprintf(note_buf, sizeof(note_buf), "quantum_burst:%s", decision.action);
+                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, note_buf);
             }
+            pthread_mutex_unlock(&ctx->model->mu);
             free(pre_direction); free(post_direction);
             immune_snap_free(&delta_snap);
             qb_reset(ctx->qbuf);
 
+            /* Delta module growth — influenced by syntropy.
+             * And lo, when syntropy is strong and purpose is aligned,
+             * new souls shall be appended with greater eagerness. */
+            double grow_prob = CFG.delta_grow_prob;
+            if (decision.delta_grow_override >= 0.0)
+                grow_prob = decision.delta_grow_override;
             if (ctx->model->n_deltas < CFG.max_delta_modules &&
-                rand_uniform() < CFG.delta_grow_prob) {
+                rand_uniform() < grow_prob) {
                 printf("[trainer] growing new delta module (total: %d) — new soul appended.\n",
                        ctx->model->n_deltas + 1);
                 pthread_mutex_lock(&ctx->model->mu);
@@ -2656,12 +3134,14 @@ int main(void) {
     QuantumBuffer qbuf;
     qb_init(&qbuf);
 
-    /* Background trainer thread */
+    /* Background trainer thread — with syntropy tracker riding alongside */
     volatile int warmed_up = 0;
     TrainerCtx tctx = {
         .db = db, .model = model, .tok = tok,
-        .qbuf = &qbuf, .warmed_up = &warmed_up, .stop = 0
+        .qbuf = &qbuf, .field = cooccur,
+        .warmed_up = &warmed_up, .stop = 0
     };
+    syntropy_init(&tctx.syntracker);
     pthread_t trainer_tid;
     pthread_create(&trainer_tid, NULL, background_trainer, &tctx);
 

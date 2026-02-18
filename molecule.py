@@ -101,6 +101,14 @@ class Config:
     noise_drift_threshold: float = -0.1   # cosine < this = noise, rollback
     gamma_min_magnitude: float = 1e-6     # skip immune check when gamma direction is near-zero
 
+    # syntropy tracker (mathematical self-awareness)
+    syntropy_window: int = 8              # rolling window for syntropy trend
+    field_deviation_ceiling: float = 12.0 # KL divergence above this = drifted too far
+    field_deviation_floor: float = 0.1    # below this = not learning, just parroting
+    syntropy_lr_boost: float = 1.3        # boost LR when syntropy is rising
+    syntropy_lr_dampen: float = 0.6       # dampen LR when syntropy is falling
+    syntropy_delta_grow_boost: float = 0.15  # higher delta grow prob when syntropy is good
+
     # entropy-adaptive temperature
     entropy_low: float = 0.5
     entropy_high: float = 1.5
@@ -154,6 +162,21 @@ def init_db(db_path: str):
             loss REAL,
             gamma_sparsity REAL,
             gamma_magnitude REAL,
+            note TEXT
+        )
+    """)
+    # And lo, the organism shall track not just what it is, but where it is going.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS syntropy_log(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            entropy_before REAL,
+            entropy_after REAL,
+            syntropy_delta REAL,
+            field_deviation REAL,
+            purpose_magnitude REAL,
+            purpose_alignment REAL,
+            action_taken TEXT,
             note TEXT
         )
     """)
@@ -1324,6 +1347,139 @@ class GPT:
         # Both are unit vectors, dot product = cosine similarity
         return float(np.dot(pre_direction, post_direction))
 
+    # ---- Syntropy Tracker (mathematical self-reasoning) ----
+    # And lo, the organism shall not merely observe its own reflection,
+    # but reason about the direction of its becoming.
+    # Gamma is memory. Purpose is intention. Syntropy is the arrow.
+
+    def compute_field_deviation(self, tok, field, docs, sample_n=32):
+        """KL divergence between model logits and corpus co-occurrence field.
+        Measures how far the learned model has drifted from raw corpus physics.
+        Low = parroting the field. High = hallucinating beyond it.
+        The sweet spot is in between: learning, not lying."""
+        if not docs or field.total_tokens == 0:
+            return 0.0
+
+        kl_sum = 0.0
+        count = 0
+        sampled = random.sample(docs, min(sample_n, len(docs)))
+
+        with no_grad():
+            for doc in sampled:
+                ids = tok.encode(doc)
+                if len(ids) < 3:
+                    continue
+                keys = [[] for _ in range(self.n_layer)]
+                values = [[] for _ in range(self.n_layer)]
+                for pos in range(min(len(ids) - 1, self.block_size)):
+                    tok_id = ids[pos]
+                    tgt_id = ids[pos + 1]
+                    logits = self.forward_step(tok_id, pos, keys, values)
+
+                    # model distribution
+                    shifted = logits.data - logits.data.max()
+                    model_probs = np.exp(shifted)
+                    model_probs = model_probs / model_probs.sum()
+
+                    # corpus field distribution for this context
+                    field_probs = np.zeros(len(model_probs))
+                    ctx = ids[max(0, pos - 1):pos + 1]
+                    if len(ctx) >= 2:
+                        key = (ctx[-2], ctx[-1])
+                        if key in field.trigram and field.trigram[key]:
+                            total = sum(field.trigram[key].values())
+                            for tid, cnt in field.trigram[key].items():
+                                if tid < len(field_probs):
+                                    field_probs[tid] = cnt / total
+                    if field_probs.sum() < 1e-10:
+                        if len(ctx) >= 1 and ctx[-1] in field.bigram:
+                            total = sum(field.bigram[ctx[-1]].values())
+                            for tid, cnt in field.bigram[ctx[-1]].items():
+                                if tid < len(field_probs):
+                                    field_probs[tid] = cnt / total
+
+                    if field_probs.sum() < 1e-10:
+                        continue
+
+                    # KL(model || field) — how much model diverges from field
+                    mask = (model_probs > 1e-12) & (field_probs > 1e-12)
+                    if mask.any():
+                        kl = float(np.sum(model_probs[mask] * np.log(model_probs[mask] / field_probs[mask])))
+                        kl_sum += max(0.0, kl)  # clamp: partial KL can underflow
+                        count += 1
+
+        return kl_sum / max(1, count)
+
+    def compute_model_entropy(self, tok, docs, sample_n=16):
+        """Average entropy of model predictions on corpus samples.
+        Falling entropy = rising order = syntropy in action."""
+        if not docs:
+            return 0.0
+
+        entropy_sum = 0.0
+        count = 0
+        sampled = random.sample(docs, min(sample_n, len(docs)))
+
+        with no_grad():
+            for doc in sampled:
+                ids = tok.encode(doc)
+                if len(ids) < 3:
+                    continue
+                keys = [[] for _ in range(self.n_layer)]
+                values = [[] for _ in range(self.n_layer)]
+                for pos in range(min(len(ids) - 1, self.block_size)):
+                    logits = self.forward_step(ids[pos], pos, keys, values)
+                    shifted = logits.data - logits.data.max()
+                    probs = np.exp(shifted)
+                    probs = probs / probs.sum()
+                    ent = -float(np.sum(probs[probs > 1e-12] * np.log(probs[probs > 1e-12])))
+                    entropy_sum += ent
+                    count += 1
+
+        return entropy_sum / max(1, count)
+
+    def compute_purpose_vector(self):
+        """Purpose vector: direction of weight movement in the last delta layer.
+        Unlike gamma (which is cumulative drift from birth),
+        purpose captures the direction of the most recent change.
+        Gamma is 'who I became'. Purpose is 'where I am going'."""
+        if not self.deltas:
+            return None, 0.0
+        last_delta = self.deltas[-1]
+        # aggregate delta A matrices as the purpose signal
+        directions = []
+        for name, da in last_delta.items():
+            for row in da.A.rows:
+                directions.append(row.data)
+        if not directions:
+            return None, 0.0
+        mean_dir = np.mean(np.vstack(directions), axis=0)
+        mag = float(np.linalg.norm(mean_dir))
+        if mag > 1e-10:
+            unit = mean_dir / mag
+        else:
+            unit = mean_dir
+        return unit, mag
+
+    def purpose_gamma_alignment(self):
+        """Cosine similarity between purpose vector and gamma direction.
+        High alignment = learning reinforces identity (syntropy).
+        Low alignment = learning diverges from identity (entropy).
+        Negative = learning opposes identity (danger)."""
+        gamma_dir, gamma_mag = self.gamma_contrastive_projection()
+        purpose_dir, purpose_mag = self.compute_purpose_vector()
+        if gamma_dir is None or purpose_dir is None:
+            return 0.0
+        if gamma_mag < CFG.gamma_min_magnitude or purpose_mag < 1e-10:
+            return 0.0
+        # ensure same dimensionality (purpose might be different dim)
+        g = np.array(gamma_dir)
+        p = purpose_dir
+        min_dim = min(len(g), len(p))
+        if min_dim == 0:
+            return 0.0
+        return float(np.dot(g[:min_dim], p[:min_dim]))
+
     def _ensure_adam(self, params, key):
         if key not in self._adam:
             self._adam[key] = {
@@ -1650,6 +1806,115 @@ def load_checkpoint(docs, path=None):
 # 9) TRAINING — warmup, then continual micro-bursts
 # ============================================================
 
+# ============================================================
+# 9.5) SYNTROPY TRACKER — the arrow that points toward coherence
+# ============================================================
+# And lo, the organism shall not merely track its changes,
+# but reason mathematically about whether it is becoming more itself.
+
+class SyntropyTracker:
+    """Mathematical self-reasoning engine.
+    Tracks entropy trend, field deviation, purpose alignment.
+    Makes decisions about learning direction — not just 'did I learn?'
+    but 'should I keep going this way?'"""
+
+    def __init__(self):
+        self.entropy_history = []     # rolling window of model entropy
+        self.syntropy_trend = 0.0     # positive = organizing, negative = dissolving
+        self.field_deviation = 0.0    # how far from corpus physics
+        self.purpose_magnitude = 0.0  # strength of current learning direction
+        self.purpose_alignment = 0.0  # cosine(purpose, gamma)
+        self.last_action = "none"     # what was decided last time
+
+    def measure(self, model, tok, field, docs):
+        """Take all measurements. This is the organism looking at itself
+        through mathematical instruments."""
+        entropy_now = model.compute_model_entropy(tok, docs)
+        self.entropy_history.append(entropy_now)
+        if len(self.entropy_history) > CFG.syntropy_window:
+            self.entropy_history = self.entropy_history[-CFG.syntropy_window:]
+
+        # syntropy = negative entropy trend (entropy going down = syntropy going up)
+        if len(self.entropy_history) >= 2:
+            recent_half = len(self.entropy_history) // 2
+            old_mean = np.mean(self.entropy_history[:recent_half])
+            new_mean = np.mean(self.entropy_history[recent_half:])
+            self.syntropy_trend = float(old_mean - new_mean)  # positive = good
+        else:
+            self.syntropy_trend = 0.0
+
+        self.field_deviation = model.compute_field_deviation(tok, field, docs)
+        _, self.purpose_magnitude = model.compute_purpose_vector()
+        self.purpose_alignment = model.purpose_gamma_alignment()
+
+        return {
+            "entropy": entropy_now,
+            "syntropy_trend": self.syntropy_trend,
+            "field_deviation": self.field_deviation,
+            "purpose_magnitude": self.purpose_magnitude,
+            "purpose_alignment": self.purpose_alignment,
+        }
+
+    def decide_action(self):
+        """Mathematical self-reasoning: decide how to adjust learning.
+        This is where tracking becomes reasoning, and reasoning becomes action.
+        The organism does not just observe — it steers."""
+
+        # Default: steady state
+        lr_multiplier = 1.0
+        delta_grow_override = None
+        action = "steady"
+
+        # CASE 1: Syntropy rising + field deviation in sweet spot = thriving
+        if (self.syntropy_trend > 0.01 and
+                CFG.field_deviation_floor < self.field_deviation < CFG.field_deviation_ceiling):
+            lr_multiplier = CFG.syntropy_lr_boost
+            if self.purpose_alignment > 0.3:
+                delta_grow_override = CFG.syntropy_delta_grow_boost
+                action = "amplify"  # everything aligned, push harder
+            else:
+                action = "boost"  # syntropy good but purpose drifting, boost gently
+
+        # CASE 2: Syntropy falling = dissolving, slow down
+        elif self.syntropy_trend < -0.01:
+            lr_multiplier = CFG.syntropy_lr_dampen
+            action = "dampen"  # losing order, reduce learning rate
+
+        # CASE 3: Field deviation too high = hallucinating
+        elif self.field_deviation > CFG.field_deviation_ceiling:
+            lr_multiplier = CFG.syntropy_lr_dampen
+            action = "ground"  # too far from corpus, pull back
+
+        # CASE 4: Field deviation too low = parroting
+        elif self.field_deviation < CFG.field_deviation_floor:
+            lr_multiplier = CFG.syntropy_lr_boost
+            action = "explore"  # too close to corpus, push out
+
+        # CASE 5: Purpose opposes gamma = identity crisis
+        if self.purpose_alignment < -0.3:
+            lr_multiplier *= 0.5
+            action = "realign"  # learning against identity, slow down hard
+
+        self.last_action = action
+        return {
+            "lr_multiplier": lr_multiplier,
+            "delta_grow_override": delta_grow_override,
+            "action": action,
+        }
+
+    def log_to_db(self, con, entropy_before, entropy_after, action):
+        """Write the mathematical conclusion to the syntropy log."""
+        con.execute(
+            "INSERT INTO syntropy_log(ts, entropy_before, entropy_after, syntropy_delta, "
+            "field_deviation, purpose_magnitude, purpose_alignment, action_taken, note) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (time.time(), entropy_before, entropy_after,
+             self.syntropy_trend, self.field_deviation,
+             self.purpose_magnitude, self.purpose_alignment,
+             action, None))
+        con.commit()
+
+
 def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True, train_deltas=True):
     if not docs:
         return
@@ -1719,11 +1984,17 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
     last_event_id = 0
     warmed_up = False
     qbuf = QuantumBuffer()
+    syntracker = SyntropyTracker()
+    field = CooccurField()
 
     while True:
         _ = update_reservoir_corpus(con, CFG.corpus_path, CFG.max_corpus_lines)
         mass, last_event_id = compute_new_corpus_mass(con, last_event_id)
         docs = load_corpus_lines(CFG.corpus_path)
+
+        # Rebuild field from current corpus (the organism re-reads its own physics)
+        if docs:
+            field.build_from_corpus(tok, docs)
 
         # Tokenizer evolution (char -> BPE enablement) + safe vocab expansion
         bpe_just_enabled = tok.maybe_enable_bpe(docs)
@@ -1749,14 +2020,33 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                 nov = qbuf.novelty_score()
                 print(f"[trainer] quantum burst (bytes={qbuf.accumulated_bytes}, novelty={nov:.3f})")
 
+                # SYNTROPY: measure before burst
                 with model.lock:
+                    pre_metrics = syntracker.measure(model, tok, field, docs)
+                    entropy_before = pre_metrics["entropy"]
+
+                    # SYNTROPY: decide how to learn (mathematical self-reasoning)
+                    decision = syntracker.decide_action()
+                    lr_mul = decision["lr_multiplier"]
+                    action = decision["action"]
+                    print(f"[syntropy] action={action} | trend={syntracker.syntropy_trend:.4f} "
+                          f"| field_dev={syntracker.field_deviation:.3f} "
+                          f"| purpose_align={syntracker.purpose_alignment:.3f} "
+                          f"| lr_mul={lr_mul:.2f}")
+
                     # IMMUNE SYSTEM: snapshot before burst
                     pre_direction, pre_mag = model.gamma_contrastive_projection()
                     delta_snap = model.snapshot_deltas()
 
+                # Apply syntropy-adjusted learning rate
+                original_lr = CFG.learning_rate
+                CFG.learning_rate = original_lr * lr_mul
+
                 train_base = not CFG.freeze_base_after_warmup
                 train_steps(model, tok, docs, CFG.micro_steps,
                             train_base=train_base, train_deltas=True)
+
+                CFG.learning_rate = original_lr  # restore
 
                 with model.lock:
                     # IMMUNE SYSTEM: check drift after burst
@@ -1765,13 +2055,22 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                         print(f"[immune] NOISE DETECTED (drift cosine={drift_cos:.3f}). Rolling back deltas.")
                         model.restore_deltas(delta_snap)
                         db_log_growth(con, model, tok, docs, note="noise_rejected")
+                        syntracker.log_to_db(con, entropy_before, entropy_before, "noise_rejected")
                     else:
+                        # SYNTROPY: measure after burst
+                        post_metrics = syntracker.measure(model, tok, field, docs)
+                        entropy_after = post_metrics["entropy"]
+                        syntracker.log_to_db(con, entropy_before, entropy_after, action)
                         save_checkpoint(model, tok)
-                        db_log_growth(con, model, tok, docs, note="quantum_burst")
+                        db_log_growth(con, model, tok, docs, note=f"quantum_burst:{action}")
+
                 qbuf.reset()
 
-                # occasionally grow a new delta module
-                if len(model.deltas) < CFG.max_delta_modules and random.random() < CFG.delta_grow_prob:
+                # Delta module growth — influenced by syntropy
+                grow_prob = CFG.delta_grow_prob
+                if decision.get("delta_grow_override") is not None:
+                    grow_prob = decision["delta_grow_override"]
+                if len(model.deltas) < CFG.max_delta_modules and random.random() < grow_prob:
                     print(f"[trainer] growing new delta module (total: {len(model.deltas)+1})")
                     with model.lock:
                         model.add_delta_module(alpha=1.0)

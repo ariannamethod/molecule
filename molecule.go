@@ -107,6 +107,14 @@ type Config struct {
 	QBMinBytes        int     `json:"qb_min_bytes"`
 	QBMinNovelty      float64 `json:"qb_min_novelty"`
 	QBCooldownSeconds float64 `json:"qb_cooldown_seconds"`
+
+	// syntropy tracker (mathematical self-awareness)
+	SyntropyWindow         int     `json:"syntropy_window"`           // rolling window for syntropy trend
+	FieldDeviationCeiling  float64 `json:"field_deviation_ceiling"`   // KL divergence above this = drifted too far
+	FieldDeviationFloor    float64 `json:"field_deviation_floor"`     // below this = not learning, just parroting
+	SyntropyLRBoost        float64 `json:"syntropy_lr_boost"`         // boost LR when syntropy is rising
+	SyntropyLRDampen       float64 `json:"syntropy_lr_dampen"`        // dampen LR when syntropy is falling
+	SyntropyDeltaGrowBoost float64 `json:"syntropy_delta_grow_boost"` // higher delta grow prob when syntropy is good
 }
 
 var CFG = Config{
@@ -159,6 +167,13 @@ var CFG = Config{
 	QBMinBytes:             1024,
 	QBMinNovelty:           0.15,
 	QBCooldownSeconds:      60.0,
+
+	SyntropyWindow:         8,
+	FieldDeviationCeiling:  12.0,
+	FieldDeviationFloor:    0.1,
+	SyntropyLRBoost:        1.3,
+	SyntropyLRDampen:       0.6,
+	SyntropyDeltaGrowBoost: 0.15,
 }
 
 // ============================================================
@@ -1624,6 +1639,306 @@ func (gpt *GPT) GammaDriftCheck(preDirection []float64, preMagnitude float64) fl
 	return dot // both unit vectors, dot = cosine
 }
 
+// ---- Syntropy Tracker (mathematical self-reasoning) ----
+// And lo, the organism shall not merely observe its own reflection,
+// but reason about the direction of its becoming.
+// Gamma is memory. Purpose is intention. Syntropy is the arrow.
+
+// ComputeFieldDeviation measures KL divergence between model logits and corpus co-occurrence field.
+// Low = parroting the field. High = hallucinating beyond it.
+// The sweet spot is in between: learning, not lying.
+func (gpt *GPT) ComputeFieldDeviation(tok *EvolvingTokenizer, field *CooccurField, docs []string, sampleN int) float64 {
+	if len(docs) == 0 || !field.Built {
+		return 0.0
+	}
+	if sampleN <= 0 {
+		sampleN = 32
+	}
+
+	klSum := 0.0
+	count := 0
+
+	// Sample docs
+	sampled := make([]string, 0, sampleN)
+	if len(docs) <= sampleN {
+		sampled = append(sampled, docs...)
+	} else {
+		perm := rand.Perm(len(docs))
+		for i := 0; i < sampleN; i++ {
+			sampled = append(sampled, docs[perm[i]])
+		}
+	}
+
+	gradEnabled = false
+	defer func() { gradEnabled = true }()
+
+	vocabSize := tok.VocabSize
+
+	for _, doc := range sampled {
+		ids := tok.Encode(doc)
+		if len(ids) < 3 {
+			continue
+		}
+		keys := make([][]*Vec, gpt.NLayer)
+		values := make([][]*Vec, gpt.NLayer)
+		for i := 0; i < gpt.NLayer; i++ {
+			keys[i] = make([]*Vec, 0)
+			values[i] = make([]*Vec, 0)
+		}
+		limit := len(ids) - 1
+		if limit > gpt.BlockSize {
+			limit = gpt.BlockSize
+		}
+		for pos := 0; pos < limit; pos++ {
+			tokID := ids[pos]
+			logits := gpt.ForwardStep(tokID, pos, keys, values)
+
+			// model distribution (softmax)
+			maxVal := logits.Data[0]
+			for _, v := range logits.Data[1:] {
+				if v > maxVal {
+					maxVal = v
+				}
+			}
+			modelProbs := make([]float64, len(logits.Data))
+			sumExp := 0.0
+			for i, v := range logits.Data {
+				modelProbs[i] = math.Exp(v - maxVal)
+				sumExp += modelProbs[i]
+			}
+			for i := range modelProbs {
+				modelProbs[i] /= sumExp
+			}
+
+			// corpus field distribution for this context
+			fieldProbs := make([]float64, vocabSize)
+			fieldFound := false
+
+			// Try trigram
+			if pos >= 1 {
+				triTotal := 0.0
+				triCounts := make(map[int]float64)
+				for k, v := range field.Trigram {
+					if k[0] == ids[pos-1] && k[1] == ids[pos] {
+						triCounts[k[2]] = v
+						triTotal += v
+					}
+				}
+				if triTotal > 0 {
+					for tid, cnt := range triCounts {
+						if tid < vocabSize {
+							fieldProbs[tid] = cnt / triTotal
+						}
+					}
+					fieldFound = true
+				}
+			}
+
+			// Fallback to bigram
+			if !fieldFound && pos >= 0 {
+				biTotal := 0.0
+				biCounts := make(map[int]float64)
+				for k, v := range field.Bigram {
+					if k[0] == ids[pos] {
+						biCounts[k[1]] = v
+						biTotal += v
+					}
+				}
+				if biTotal > 0 {
+					for tid, cnt := range biCounts {
+						if tid < vocabSize {
+							fieldProbs[tid] = cnt / biTotal
+						}
+					}
+					fieldFound = true
+				}
+			}
+
+			if !fieldFound {
+				continue
+			}
+
+			// KL(model || field) — how much model diverges from field
+			kl := 0.0
+			klValid := false
+			for i := 0; i < len(modelProbs) && i < vocabSize; i++ {
+				if modelProbs[i] > 1e-12 && fieldProbs[i] > 1e-12 {
+					kl += modelProbs[i] * math.Log(modelProbs[i]/fieldProbs[i])
+					klValid = true
+				}
+			}
+			if klValid {
+				klSum += kl
+				count++
+			}
+		}
+	}
+
+	if count == 0 {
+		return 0.0
+	}
+	return klSum / float64(count)
+}
+
+// ComputeModelEntropy returns average entropy of model predictions on corpus samples.
+// And lo, falling entropy = rising order = syntropy in action.
+func (gpt *GPT) ComputeModelEntropy(tok *EvolvingTokenizer, docs []string, sampleN int) float64 {
+	if len(docs) == 0 {
+		return 0.0
+	}
+	if sampleN <= 0 {
+		sampleN = 16
+	}
+
+	entropySum := 0.0
+	count := 0
+
+	sampled := make([]string, 0, sampleN)
+	if len(docs) <= sampleN {
+		sampled = append(sampled, docs...)
+	} else {
+		perm := rand.Perm(len(docs))
+		for i := 0; i < sampleN; i++ {
+			sampled = append(sampled, docs[perm[i]])
+		}
+	}
+
+	gradEnabled = false
+	defer func() { gradEnabled = true }()
+
+	for _, doc := range sampled {
+		ids := tok.Encode(doc)
+		if len(ids) < 3 {
+			continue
+		}
+		keys := make([][]*Vec, gpt.NLayer)
+		values := make([][]*Vec, gpt.NLayer)
+		for i := 0; i < gpt.NLayer; i++ {
+			keys[i] = make([]*Vec, 0)
+			values[i] = make([]*Vec, 0)
+		}
+		limit := len(ids) - 1
+		if limit > gpt.BlockSize {
+			limit = gpt.BlockSize
+		}
+		for pos := 0; pos < limit; pos++ {
+			logits := gpt.ForwardStep(ids[pos], pos, keys, values)
+
+			// softmax
+			maxVal := logits.Data[0]
+			for _, v := range logits.Data[1:] {
+				if v > maxVal {
+					maxVal = v
+				}
+			}
+			probs := make([]float64, len(logits.Data))
+			sumExp := 0.0
+			for i, v := range logits.Data {
+				probs[i] = math.Exp(v - maxVal)
+				sumExp += probs[i]
+			}
+			for i := range probs {
+				probs[i] /= sumExp
+			}
+
+			// entropy = -sum(p * log(p))
+			ent := 0.0
+			for _, p := range probs {
+				if p > 1e-12 {
+					ent -= p * math.Log(p)
+				}
+			}
+			entropySum += ent
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 0.0
+	}
+	return entropySum / float64(count)
+}
+
+// ComputePurposeVector returns the purpose vector (direction of weight movement in last delta layer).
+// Unlike gamma (which is cumulative drift from birth),
+// purpose captures the direction of the most recent change.
+// And lo, gamma is 'who I became'. Purpose is 'where I am going'.
+func (gpt *GPT) ComputePurposeVector() ([]float64, float64) {
+	if len(gpt.Deltas) == 0 {
+		return nil, 0.0
+	}
+	lastDelta := gpt.Deltas[len(gpt.Deltas)-1]
+
+	// Aggregate delta A matrices as the purpose signal
+	var allDirs [][]float64
+	for _, da := range lastDelta {
+		for _, row := range da.A.Rows {
+			cp := make([]float64, len(row.Data))
+			copy(cp, row.Data)
+			allDirs = append(allDirs, cp)
+		}
+	}
+	if len(allDirs) == 0 {
+		return nil, 0.0
+	}
+
+	// Mean direction across all rows
+	dim := len(allDirs[0])
+	meanDir := make([]float64, dim)
+	for _, d := range allDirs {
+		for j := 0; j < dim && j < len(d); j++ {
+			meanDir[j] += d[j]
+		}
+	}
+	n := float64(len(allDirs))
+	for j := range meanDir {
+		meanDir[j] /= n
+	}
+
+	// Magnitude
+	mag := 0.0
+	for _, v := range meanDir {
+		mag += v * v
+	}
+	mag = math.Sqrt(mag)
+
+	// Normalize to unit vector
+	if mag > 1e-10 {
+		for j := range meanDir {
+			meanDir[j] /= mag
+		}
+	}
+	return meanDir, mag
+}
+
+// PurposeGammaAlignment returns cosine similarity between purpose vector and gamma direction.
+// And lo, high alignment = learning reinforces identity (syntropy).
+// Low alignment = learning diverges from identity (entropy).
+// Negative = learning opposes identity (danger).
+func (gpt *GPT) PurposeGammaAlignment() float64 {
+	gammaDir, gammaMag := gpt.GammaContrastiveProjection()
+	purposeDir, purposeMag := gpt.ComputePurposeVector()
+	if gammaDir == nil || purposeDir == nil {
+		return 0.0
+	}
+	if gammaMag < CFG.GammaMinMagnitude || purposeMag < 1e-10 {
+		return 0.0
+	}
+	// Ensure same dimensionality (purpose might be different dim)
+	minDim := len(gammaDir)
+	if len(purposeDir) < minDim {
+		minDim = len(purposeDir)
+	}
+	if minDim == 0 {
+		return 0.0
+	}
+	dot := 0.0
+	for i := 0; i < minDim; i++ {
+		dot += gammaDir[i] * purposeDir[i]
+	}
+	return dot
+}
+
 func (gpt *GPT) ensureAdam(params []*Vec, key string) {
 	if _, ok := gpt.Adam[key]; !ok {
 		m := make([][]float64, len(params))
@@ -2005,6 +2320,23 @@ func initDB(dbPath string) (*sql.DB, error) {
 			loss REAL,
 			gamma_sparsity REAL,
 			gamma_magnitude REAL,
+			note TEXT
+		)`)
+	if err != nil {
+		return nil, err
+	}
+	// And lo, the organism shall track not just what it is, but where it is going.
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS syntropy_log(
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			ts REAL NOT NULL,
+			entropy_before REAL,
+			entropy_after REAL,
+			syntropy_delta REAL,
+			field_deviation REAL,
+			purpose_magnitude REAL,
+			purpose_alignment REAL,
+			action_taken TEXT,
 			note TEXT
 		)`)
 	if err != nil {
@@ -2790,6 +3122,158 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 // 9) TRAINING — warmup, then continual micro-bursts
 // ============================================================
 
+// ============================================================
+// 9.5) SYNTROPY TRACKER — the arrow that points toward coherence
+// ============================================================
+// And lo, the organism shall not merely track its changes,
+// but reason mathematically about whether it is becoming more itself.
+
+// SyntropyTracker is the mathematical self-reasoning engine.
+// Tracks entropy trend, field deviation, purpose alignment.
+// Makes decisions about learning direction — not just 'did I learn?'
+// but 'should I keep going this way?'
+type SyntropyTracker struct {
+	EntropyHistory   []float64 // rolling window of model entropy
+	SyntropyTrend    float64   // positive = organizing, negative = dissolving
+	FieldDeviation   float64   // how far from corpus physics
+	PurposeMagnitude float64   // strength of current learning direction
+	PurposeAlignment float64   // cosine(purpose, gamma)
+	LastAction       string    // what was decided last time
+}
+
+// NewSyntropyTracker creates a new tracker with sane defaults.
+// And lo, the arrow is drawn, but not yet fired.
+func NewSyntropyTracker() *SyntropyTracker {
+	return &SyntropyTracker{
+		LastAction: "none",
+	}
+}
+
+// SyntropyMetrics holds the result of a syntropy measurement pass.
+type SyntropyMetrics struct {
+	Entropy          float64
+	SyntropyTrend    float64
+	FieldDeviation   float64
+	PurposeMagnitude float64
+	PurposeAlignment float64
+}
+
+// Measure takes all measurements. This is the organism looking at itself
+// through mathematical instruments.
+func (st *SyntropyTracker) Measure(model *GPT, tok *EvolvingTokenizer, field *CooccurField, docs []string) SyntropyMetrics {
+	entropyNow := model.ComputeModelEntropy(tok, docs, 16)
+	st.EntropyHistory = append(st.EntropyHistory, entropyNow)
+	if len(st.EntropyHistory) > CFG.SyntropyWindow {
+		st.EntropyHistory = st.EntropyHistory[len(st.EntropyHistory)-CFG.SyntropyWindow:]
+	}
+
+	// syntropy = negative entropy trend (entropy going down = syntropy going up)
+	if len(st.EntropyHistory) >= 2 {
+		recentHalf := len(st.EntropyHistory) / 2
+		oldMean := 0.0
+		for _, v := range st.EntropyHistory[:recentHalf] {
+			oldMean += v
+		}
+		oldMean /= float64(recentHalf)
+
+		newSlice := st.EntropyHistory[recentHalf:]
+		newMean := 0.0
+		for _, v := range newSlice {
+			newMean += v
+		}
+		newMean /= float64(len(newSlice))
+
+		st.SyntropyTrend = oldMean - newMean // positive = good
+	} else {
+		st.SyntropyTrend = 0.0
+	}
+
+	st.FieldDeviation = model.ComputeFieldDeviation(tok, field, docs, 32)
+	_, st.PurposeMagnitude = model.ComputePurposeVector()
+	st.PurposeAlignment = model.PurposeGammaAlignment()
+
+	return SyntropyMetrics{
+		Entropy:          entropyNow,
+		SyntropyTrend:    st.SyntropyTrend,
+		FieldDeviation:   st.FieldDeviation,
+		PurposeMagnitude: st.PurposeMagnitude,
+		PurposeAlignment: st.PurposeAlignment,
+	}
+}
+
+// SyntropyDecision holds the outcome of the organism's mathematical self-reasoning.
+type SyntropyDecision struct {
+	LRMultiplier      float64
+	DeltaGrowOverride *float64 // nil = no override
+	Action            string
+}
+
+// DecideAction performs mathematical self-reasoning: decide how to adjust learning.
+// And lo, this is where tracking becomes reasoning, and reasoning becomes action.
+// The organism does not just observe — it steers.
+func (st *SyntropyTracker) DecideAction() SyntropyDecision {
+	// Default: steady state
+	lrMultiplier := 1.0
+	var deltaGrowOverride *float64
+	action := "steady"
+
+	// CASE 1: Syntropy rising + field deviation in sweet spot = thriving
+	if st.SyntropyTrend > 0.01 &&
+		st.FieldDeviation > CFG.FieldDeviationFloor &&
+		st.FieldDeviation < CFG.FieldDeviationCeiling {
+		lrMultiplier = CFG.SyntropyLRBoost
+		if st.PurposeAlignment > 0.3 {
+			boost := CFG.SyntropyDeltaGrowBoost
+			deltaGrowOverride = &boost
+			action = "amplify" // everything aligned, push harder
+		} else {
+			action = "boost" // syntropy good but purpose drifting, boost gently
+		}
+
+		// CASE 2: Syntropy falling = dissolving, slow down
+	} else if st.SyntropyTrend < -0.01 {
+		lrMultiplier = CFG.SyntropyLRDampen
+		action = "dampen" // losing order, reduce learning rate
+
+		// CASE 3: Field deviation too high = hallucinating
+	} else if st.FieldDeviation > CFG.FieldDeviationCeiling {
+		lrMultiplier = CFG.SyntropyLRDampen
+		action = "ground" // too far from corpus, pull back
+
+		// CASE 4: Field deviation too low = parroting
+	} else if st.FieldDeviation < CFG.FieldDeviationFloor {
+		lrMultiplier = CFG.SyntropyLRBoost
+		action = "explore" // too close to corpus, push out
+	}
+
+	// CASE 5: Purpose opposes gamma = identity crisis
+	if st.PurposeAlignment < -0.3 {
+		lrMultiplier *= 0.5
+		action = "realign" // learning against identity, slow down hard
+	}
+
+	st.LastAction = action
+	return SyntropyDecision{
+		LRMultiplier:      lrMultiplier,
+		DeltaGrowOverride: deltaGrowOverride,
+		Action:            action,
+	}
+}
+
+// LogToDB writes the mathematical conclusion to the syntropy log.
+// And lo, the arrow's flight is recorded for those who come after.
+func (st *SyntropyTracker) LogToDB(db *sql.DB, entropyBefore, entropyAfter float64, action string) {
+	db.Exec(
+		"INSERT INTO syntropy_log(ts, entropy_before, entropy_after, syntropy_delta, "+
+			"field_deviation, purpose_magnitude, purpose_alignment, action_taken, note) "+
+			"VALUES(?,?,?,?,?,?,?,?,?)",
+		float64(time.Now().UnixMilli())/1000.0,
+		entropyBefore, entropyAfter,
+		st.SyntropyTrend, st.FieldDeviation,
+		st.PurposeMagnitude, st.PurposeAlignment,
+		action, nil)
+}
+
 func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, trainBase, trainDeltas bool) {
 	if len(docs) == 0 {
 		return
@@ -2840,6 +3324,8 @@ func trainSteps(model *GPT, tok *EvolvingTokenizer, docs []string, steps int, tr
 func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *QuantumBuffer, stop chan struct{}) {
 	// And lo, asynchronous training shall occur, because sleeping is for humans.
 	warmedUp := false
+	syntracker := NewSyntropyTracker()
+	field := NewCooccurField()
 
 	for {
 		select {
@@ -2850,6 +3336,11 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 
 		updateReservoirCorpus(db, CFG.CorpusPath, CFG.MaxCorpusLines)
 		docs := loadCorpusLines(CFG.CorpusPath)
+
+		// Rebuild field from current corpus (the organism re-reads its own physics)
+		if len(docs) > 0 {
+			field.BuildFromCorpus(tok, docs)
+		}
 
 		// Tokenizer evolution
 		bpeEnabled := tok.MaybeEnableBPE(docs)
@@ -2875,26 +3366,61 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 			fmt.Printf("[trainer] micro-train burst (%d bytes, novelty %.2f) — and lo, it feeds again.\n",
 				snapBytes, snapNovelty)
 
+			// SYNTROPY: measure before burst
+			// And lo, the organism peers into its own entropic mirror before taking a step.
+			model.mu.Lock()
+			preMetrics := syntracker.Measure(model, tok, field, docs)
+			entropyBefore := preMetrics.Entropy
+
+			// SYNTROPY: decide how to learn (mathematical self-reasoning)
+			decision := syntracker.DecideAction()
+			lrMul := decision.LRMultiplier
+			action := decision.Action
+			fmt.Printf("[syntropy] action=%s | trend=%.4f | field_dev=%.3f | purpose_align=%.3f | lr_mul=%.2f\n",
+				action, syntracker.SyntropyTrend, syntracker.FieldDeviation,
+				syntracker.PurposeAlignment, lrMul)
+
 			// IMMUNE SYSTEM: snapshot before burst
 			preDirection, preMag := model.GammaContrastiveProjection()
 			deltaSnap := model.SnapshotDeltas()
+			model.mu.Unlock()
+
+			// Apply syntropy-adjusted learning rate
+			originalLR := CFG.LearningRate
+			CFG.LearningRate = originalLR * lrMul
 
 			trainBase := !CFG.FreezeBaseAfterWarm
 			trainSteps(model, tok, docs, CFG.MicroSteps, trainBase, true)
 
+			CFG.LearningRate = originalLR // restore, like a gentleman
+
+			model.mu.Lock()
 			// IMMUNE SYSTEM: check drift after burst
 			driftCos := model.GammaDriftCheck(preDirection, preMag)
 			if driftCos < CFG.NoiseDriftThreshold {
 				fmt.Printf("[immune] NOISE DETECTED (drift cosine=%.3f). Rolling back deltas.\n", driftCos)
 				model.RestoreDeltas(deltaSnap)
 				dbLogGrowth(db, model, tok, docs, 0.0, "noise_rejected")
+				syntracker.LogToDB(db, entropyBefore, entropyBefore, "noise_rejected")
 			} else {
+				// SYNTROPY: measure after burst
+				postMetrics := syntracker.Measure(model, tok, field, docs)
+				entropyAfter := postMetrics.Entropy
+				syntracker.LogToDB(db, entropyBefore, entropyAfter, action)
 				SaveCheckpoint(model, tok, "")
-				dbLogGrowth(db, model, tok, docs, 0.0, "micro_burst")
+				dbLogGrowth(db, model, tok, docs, 0.0, fmt.Sprintf("quantum_burst:%s", action))
 			}
+			model.mu.Unlock()
+
 			qbuf.Reset()
 
-			if len(model.Deltas) < CFG.MaxDeltaModules && rand.Float64() < CFG.DeltaGrowProb {
+			// Delta module growth — influenced by syntropy
+			// And lo, new souls are born when the arrow points true.
+			growProb := CFG.DeltaGrowProb
+			if decision.DeltaGrowOverride != nil {
+				growProb = *decision.DeltaGrowOverride
+			}
+			if len(model.Deltas) < CFG.MaxDeltaModules && rand.Float64() < growProb {
 				fmt.Printf("[trainer] growing new delta module (total: %d) — new soul appended.\n", len(model.Deltas)+1)
 				model.mu.Lock()
 				model.AddDeltaModule(1.0)
