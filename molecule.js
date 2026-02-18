@@ -1462,6 +1462,9 @@ class GPT {
             this._initEmbedSnapshot.push(new Float64Array(row.data));
         }
 
+        // syntropy temperature offset (adjusted by syntropy tracker decisions)
+        this.syntropyTempOffset = 0;
+
         // ensure at least one delta
         this.addDeltaModule(1.0);
     }
@@ -1932,6 +1935,21 @@ class GPT {
         return total.mul(1.0 / batchIds.length);
     }
 
+    quickLoss(tok, docs, n) {
+        if (!n) n = 4;
+        if (!docs.length) return 0.0;
+        return withNoGrad(() => {
+            const sampled = randomSample(docs, Math.min(n, docs.length));
+            const batchIds = sampled.filter(d => d).map(d => tok.encode(d));
+            if (!batchIds.length) return 0.0;
+            let total = 0;
+            for (const ids of batchIds) {
+                total += this.lossOnSequence(ids).data;
+            }
+            return total / batchIds.length;
+        });
+    }
+
     generateSentence(promptText) {
         return withNoGrad(() => this._generateSentenceImpl(promptText || ""));
     }
@@ -1962,8 +1980,8 @@ class GPT {
             const pos = Math.min(ids.length - 1, this.blockSize - 1);
             const logits = this.forwardStep(cur, pos, keys, values);
 
-            // entropy-adaptive temperature
-            let baseTemp = CFG.temperature;
+            // entropy-adaptive temperature (with syntropy offset)
+            let baseTemp = CFG.temperature + this.syntropyTempOffset;
             if (baseTemp <= 1e-6) baseTemp = 1e-6;
             const rawScaled = new Array(logits.data.length);
             for (let i = 0; i < logits.data.length; i++) rawScaled[i] = logits.data[i] / baseTemp;
@@ -2203,6 +2221,22 @@ class SyntropyTracker {
         this.purposeMagnitude = 0.0;
         this.purposeAlignment = 0.0;
         this.lastAction = "none";
+        this.burstHistory = [];
+    }
+
+    recordBurst(action, lossBefore, lossAfter) {
+        this.burstHistory.push({ action, lossBefore, lossAfter });
+        if (this.burstHistory.length > 16) {
+            this.burstHistory = this.burstHistory.slice(-16);
+        }
+    }
+
+    actionEffectiveness(action) {
+        const matching = this.burstHistory.filter(b => b.action === action);
+        if (matching.length === 0) return { mean: 0.0, count: 0 };
+        let sum = 0;
+        for (const b of matching) sum += (b.lossBefore - b.lossAfter);
+        return { mean: sum / matching.length, count: matching.length };
     }
 
     measure(model, tok, field, docs) {
@@ -2242,6 +2276,8 @@ class SyntropyTracker {
         let lrMultiplier = 1.0;
         let deltaGrowOverride = null;
         let action = "steady";
+        let tempOffset = 0.0;
+        let accumOverride = 0;
 
         if (this.syntropyTrend > 0.01 &&
             this.fieldDeviation > CFG.fieldDeviationFloor &&
@@ -2250,27 +2286,50 @@ class SyntropyTracker {
             if (this.purposeAlignment > 0.3) {
                 deltaGrowOverride = CFG.syntropyDeltaGrowBoost;
                 action = "amplify";
+                tempOffset = -0.05;
+                accumOverride = 2;
             } else {
                 action = "boost";
             }
         } else if (this.syntropyTrend < -0.01) {
             lrMultiplier = CFG.syntropyLrDampen;
             action = "dampen";
+            tempOffset = +0.05;
         } else if (this.fieldDeviation > CFG.fieldDeviationCeiling) {
             lrMultiplier = CFG.syntropyLrDampen;
             action = "ground";
+            tempOffset = -0.05;
         } else if (this.fieldDeviation < CFG.fieldDeviationFloor) {
             lrMultiplier = CFG.syntropyLrBoost;
             action = "explore";
+            tempOffset = +0.05;
         }
 
         if (this.purposeAlignment < -0.3) {
             lrMultiplier *= 0.5;
             action = "realign";
+            tempOffset = 0.0;
+        }
+
+        // SELF-META-LEARNING: downgrade actions that historically hurt loss
+        if (this.burstHistory.length >= 4) {
+            const eff = this.actionEffectiveness(action);
+            if (eff.count > 0 && eff.mean > 0.05) {
+                if (action === "amplify") {
+                    action = "boost";
+                    tempOffset = 0.0;
+                    accumOverride = 0;
+                    deltaGrowOverride = null;
+                } else if (action === "boost" || action === "explore") {
+                    action = "steady";
+                    tempOffset = 0.0;
+                    accumOverride = 0;
+                }
+            }
         }
 
         this.lastAction = action;
-        return { lrMultiplier, deltaGrowOverride, action };
+        return { lrMultiplier, deltaGrowOverride, action, tempOffset, accumOverride };
     }
 
     async logToDB(entropyBefore, entropyAfter, action) {
@@ -2403,6 +2462,9 @@ async function trainerTick() {
                 const preMetrics = _syntracker.measure(_model, _tok, _field, docs);
                 const entropyBefore = preMetrics.entropy;
 
+                // Phase 1.5: quickLoss before burst
+                const lossBefore = _model.quickLoss(_tok, docs, 4);
+
                 // SYNTROPY: decide
                 const decision = _syntracker.decideAction();
                 const lrMul = decision.lrMultiplier;
@@ -2411,6 +2473,13 @@ async function trainerTick() {
                       `| field_dev=${_syntracker.fieldDeviation.toFixed(3)} ` +
                       `| purpose_align=${_syntracker.purposeAlignment.toFixed(3)} ` +
                       `| lr_mul=${lrMul.toFixed(2)}`);
+
+                // Phase 1.5: apply accumOverride and syntropyTempOffset
+                const originalAccumSteps = CFG.accumSteps;
+                if (decision.accumOverride > 0) {
+                    CFG.accumSteps = decision.accumOverride;
+                }
+                _model.syntropyTempOffset = decision.tempOffset;
 
                 // IMMUNE: snapshot before burst
                 const [preDirection, preMag] = _model.gammaContrastiveProjection();
@@ -2428,10 +2497,20 @@ async function trainerTick() {
                     const steps = Math.min(chunkSize, CFG.microSteps - start);
                     trainSteps(_model, _tok, docs, steps, trainBase, true);
                     await new Promise(r => setTimeout(r, 0));
-                    if (!_trainerRunning) { CFG.learningRate = originalLr; return; }
+                    if (!_trainerRunning) {
+                        CFG.learningRate = originalLr;
+                        CFG.accumSteps = originalAccumSteps;
+                        return;
+                    }
                 }
 
                 CFG.learningRate = originalLr;
+                CFG.accumSteps = originalAccumSteps;
+
+                // Phase 1.5: quickLoss after burst
+                const lossAfter = _model.quickLoss(_tok, docs, 4);
+                const deltaLoss = lossBefore - lossAfter;
+                _syntracker.recordBurst(action, lossBefore, lossAfter);
 
                 // IMMUNE: check drift
                 const driftCos = _model.gammaDriftCheck(preDirection, preMag);
@@ -2444,7 +2523,8 @@ async function trainerTick() {
                     const postMetrics = _syntracker.measure(_model, _tok, _field, docs);
                     await _syntracker.logToDB(entropyBefore, postMetrics.entropy, action);
                     await saveCheckpoint(_model, _tok);
-                    await dbLogGrowth(_model, _tok, docs, 0, `quantum_burst:${action}`);
+                    await dbLogGrowth(_model, _tok, docs, 0,
+                        `quantum_burst:${action}|Δloss=${deltaLoss.toFixed(4)}`);
                 }
 
                 _qbuf.reset();

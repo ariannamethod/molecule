@@ -1580,6 +1580,9 @@ typedef struct {
     double residual_alpha;
     int global_step;
 
+    /* Phase 1.5: syntropy-driven temperature modulation */
+    double syntropy_temp_offset;
+
     pthread_mutex_t mu;
 } GPT;
 
@@ -1646,6 +1649,7 @@ static GPT *gpt_new(EvolvingTokenizer *tok) {
     g->block_size = CFG.block_size;
     g->residual_alpha = 1.0 / sqrt((double)CFG.n_layer);
     g->global_step = 0;
+    g->syntropy_temp_offset = 0.0;
     pthread_mutex_init(&g->mu, NULL);
 
     int V = tok->vocab_size;
@@ -1900,6 +1904,36 @@ static Node *gpt_loss_seq(GPT *g, const int *ids, int len) {
     return scalar_mulf(total, 1.0 / (double)n);
 }
 
+/* Quick loss: average loss on n random docs with grad disabled.
+ * Used for before/after measurement during syntropy bursts.
+ * And lo, the organism peeks at itself without disturbing its own learning. */
+static double gpt_quick_loss(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int n) {
+    if (docs->len == 0) return 0.0;
+
+    int prev_grad = grad_enabled;
+    grad_enabled = 0;
+
+    double loss_sum = 0.0;
+    int count = 0;
+    int n_sample = n < docs->len ? n : docs->len;
+
+    for (int s = 0; s < n_sample; s++) {
+        int doc_idx = rand_int(docs->len);
+        IntArr ids = tok_encode(tok, docs->items[doc_idx]);
+        if (ids.len < 3) { ia_free(&ids); continue; }
+
+        arena_reset(&G_arena);
+        Node *loss = gpt_loss_seq(g, ids.items, ids.len);
+        loss_sum += loss->data[0];
+        count++;
+
+        ia_free(&ids);
+    }
+
+    grad_enabled = prev_grad;
+    return count > 0 ? loss_sum / count : 0.0;
+}
+
 /* Generate */
 static char *gpt_generate(GPT *g, const char *prompt) {
     pthread_mutex_lock(&g->mu);
@@ -1936,8 +1970,8 @@ static char *gpt_generate(GPT *g, const char *prompt) {
         if (pos > g->block_size - 1) pos = g->block_size - 1;
         Node *logits = gpt_forward_step(g, cur, pos, kv);
 
-        /* Entropy-adaptive temperature */
-        double base_temp = CFG.temperature;
+        /* Entropy-adaptive temperature (with syntropy offset from Phase 1.5) */
+        double base_temp = CFG.temperature + g->syntropy_temp_offset;
         if (base_temp < 1e-6) base_temp = 1e-6;
         int V = logits->len;
         double *scaled = malloc(sizeof(double) * V);
@@ -2724,6 +2758,15 @@ static double gpt_purpose_gamma_alignment(GPT *g) {
  * This is where tracking becomes reasoning, and reasoning becomes action. */
 
 #define SYNTROPY_MAX_HISTORY 64
+#define BURST_HISTORY_MAX 16
+
+/* And lo, every burst shall leave a scar in memory,
+ * that the organism may learn which actions heal and which harm. */
+typedef struct {
+    char action[32];
+    double loss_before;
+    double loss_after;
+} BurstRecord;
 
 typedef struct {
     double entropy_history[SYNTROPY_MAX_HISTORY]; /* rolling window of model entropy */
@@ -2733,11 +2776,47 @@ typedef struct {
     double purpose_magnitude; /* strength of current learning direction */
     double purpose_alignment; /* cosine(purpose, gamma) */
     const char *last_action;  /* what was decided last time */
+
+    /* Phase 1.5: burst history for self-meta-learning */
+    BurstRecord burst_history[BURST_HISTORY_MAX];
+    int burst_history_len;
 } SyntropyTracker;
 
 static void syntropy_init(SyntropyTracker *st) {
     memset(st, 0, sizeof(SyntropyTracker));
     st->last_action = "none";
+}
+
+/* Record a burst outcome. The organism remembers what it did and what happened.
+ * And lo, circular buffer of scars: oldest falls off when full. */
+static void syntropy_record_burst(SyntropyTracker *st, const char *action,
+                                   double loss_before, double loss_after) {
+    if (st->burst_history_len >= BURST_HISTORY_MAX) {
+        memmove(st->burst_history, st->burst_history + 1,
+                sizeof(BurstRecord) * (BURST_HISTORY_MAX - 1));
+        st->burst_history_len = BURST_HISTORY_MAX - 1;
+    }
+    BurstRecord *rec = &st->burst_history[st->burst_history_len];
+    strncpy(rec->action, action, sizeof(rec->action) - 1);
+    rec->action[sizeof(rec->action) - 1] = '\0';
+    rec->loss_before = loss_before;
+    rec->loss_after = loss_after;
+    st->burst_history_len++;
+}
+
+/* How effective was a given action type? Returns mean loss delta and count.
+ * Positive delta = loss went up = BAD. Negative delta = loss went down = GOOD. */
+static double syntropy_action_effectiveness(SyntropyTracker *st, const char *action, int *out_count) {
+    double sum = 0.0;
+    int count = 0;
+    for (int i = 0; i < st->burst_history_len; i++) {
+        if (strcmp(st->burst_history[i].action, action) == 0) {
+            sum += (st->burst_history[i].loss_after - st->burst_history[i].loss_before);
+            count++;
+        }
+    }
+    if (out_count) *out_count = count;
+    return count > 0 ? sum / count : 0.0;
 }
 
 /* Take all measurements. This is the organism looking at itself
@@ -2797,6 +2876,8 @@ typedef struct {
     double lr_multiplier;
     double delta_grow_override; /* negative = no override */
     const char *action;
+    double temp_offset;        /* Phase 1.5: temperature offset (-0.05 to +0.05) */
+    int accum_override;        /* Phase 1.5: 0 = no override, >0 = use this accum_steps */
 } SyntropyDecision;
 
 static SyntropyDecision syntropy_decide_action(SyntropyTracker *st) {
@@ -2804,6 +2885,8 @@ static SyntropyDecision syntropy_decide_action(SyntropyTracker *st) {
     d.lr_multiplier = 1.0;
     d.delta_grow_override = -1.0; /* sentinel: no override */
     d.action = "steady";
+    d.temp_offset = 0.0;
+    d.accum_override = 0;
 
     /* CASE 1: Syntropy rising + field deviation in sweet spot = thriving */
     if (st->syntropy_trend > 0.01 &&
@@ -2813,6 +2896,8 @@ static SyntropyDecision syntropy_decide_action(SyntropyTracker *st) {
         if (st->purpose_alignment > 0.3) {
             d.delta_grow_override = CFG.syntropy_delta_grow_boost;
             d.action = "amplify";  /* everything aligned, push harder */
+            d.temp_offset = -0.05; /* focus: tighten distribution */
+            d.accum_override = 2;  /* accumulate more for stable amplification */
         } else {
             d.action = "boost";    /* syntropy good but purpose drifting, boost gently */
         }
@@ -2821,22 +2906,47 @@ static SyntropyDecision syntropy_decide_action(SyntropyTracker *st) {
     else if (st->syntropy_trend < -0.01) {
         d.lr_multiplier = CFG.syntropy_lr_dampen;
         d.action = "dampen";       /* losing order, reduce learning rate */
+        d.temp_offset = +0.05;     /* loosen: let entropy help find new paths */
     }
     /* CASE 3: Field deviation too high = hallucinating */
     else if (st->field_deviation > CFG.field_deviation_ceiling) {
         d.lr_multiplier = CFG.syntropy_lr_dampen;
         d.action = "ground";       /* too far from corpus, pull back */
+        d.temp_offset = -0.05;     /* focus: tighten back toward corpus */
     }
     /* CASE 4: Field deviation too low = parroting */
     else if (st->field_deviation < CFG.field_deviation_floor) {
         d.lr_multiplier = CFG.syntropy_lr_boost;
         d.action = "explore";      /* too close to corpus, push out */
+        d.temp_offset = +0.05;     /* loosen: encourage divergence */
     }
 
     /* CASE 5: Purpose opposes gamma = identity crisis */
     if (st->purpose_alignment < -0.3) {
         d.lr_multiplier *= 0.5;
         d.action = "realign";      /* learning against identity, slow down hard */
+        d.temp_offset = 0.0;       /* neutral: don't bias during realignment */
+    }
+
+    /* SELF-META-LEARNING: if we have enough history, check whether this
+     * action type has been actually helping. If its mean loss delta is
+     * positive (loss went UP on average), downgrade to something gentler.
+     * And lo, the organism shall not repeat mistakes it remembers. */
+    if (st->burst_history_len >= 4) {
+        int eff_count = 0;
+        double eff = syntropy_action_effectiveness(st, d.action, &eff_count);
+        if (eff_count >= 2 && eff > 0.05) {
+            /* This action has been hurting more than helping */
+            if (strcmp(d.action, "amplify") == 0) {
+                d.action = "boost";
+                d.temp_offset = 0.0;
+                d.accum_override = 0;
+            } else if (strcmp(d.action, "boost") == 0 || strcmp(d.action, "explore") == 0) {
+                d.action = "steady";
+                d.temp_offset = 0.0;
+                d.lr_multiplier = 1.0;
+            }
+        }
     }
 
     st->last_action = d.action;
@@ -3084,11 +3194,16 @@ static void *background_trainer(void *arg) {
             /* SYNTROPY: decide how to learn (mathematical self-reasoning) */
             decision = syntropy_decide_action(&ctx->syntracker);
             printf("[syntropy] action=%s | trend=%.4f | field_dev=%.3f "
-                   "| purpose_align=%.3f | lr_mul=%.2f\n",
+                   "| purpose_align=%.3f | lr_mul=%.2f | temp_ofs=%.3f | accum_ovr=%d\n",
                    decision.action, ctx->syntracker.syntropy_trend,
                    ctx->syntracker.field_deviation,
                    ctx->syntracker.purpose_alignment,
-                   decision.lr_multiplier);
+                   decision.lr_multiplier,
+                   decision.temp_offset,
+                   decision.accum_override);
+
+            /* Phase 1.5: measure loss BEFORE burst for self-meta-learning */
+            double loss_before = gpt_quick_loss(ctx->model, ctx->tok, &docs, 8);
 
             /* IMMUNE SYSTEM: snapshot before burst */
             int pre_dim; double pre_mag;
@@ -3101,10 +3216,18 @@ static void *background_trainer(void *arg) {
             double original_lr = CFG.learning_rate;
             CFG.learning_rate = original_lr * decision.lr_multiplier;
 
+            /* Phase 1.5: apply temp_offset and accum_override from decision */
+            ctx->model->syntropy_temp_offset = decision.temp_offset;
+            int original_accum = CFG.accum_steps;
+            if (decision.accum_override > 0)
+                CFG.accum_steps = decision.accum_override;
+
             int train_base = !CFG.freeze_base_after_warmup;
             train_steps(ctx->model, ctx->tok, &docs, CFG.micro_steps, train_base, 1);
 
             CFG.learning_rate = original_lr; /* restore */
+            CFG.accum_steps = original_accum; /* restore */
+            ctx->model->syntropy_temp_offset = 0.0; /* restore: no offset outside bursts */
 
             /* IMMUNE SYSTEM: check drift after burst */
             pthread_mutex_lock(&ctx->model->mu);
@@ -3117,16 +3240,30 @@ static void *background_trainer(void *arg) {
                 db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, "noise_rejected");
                 syntropy_log_to_db(&ctx->syntracker, ctx->db,
                                    entropy_before, entropy_before, "noise_rejected");
+                /* Record burst as rejected (loss unchanged) */
+                syntropy_record_burst(&ctx->syntracker, "noise_rejected", loss_before, loss_before);
             } else {
-                /* SYNTROPY: measure after burst */
+                /* Phase 1.5: measure loss AFTER burst */
+                double loss_after = gpt_quick_loss(ctx->model, ctx->tok, &docs, 8);
+                double delta_loss = loss_after - loss_before;
+
+                /* SYNTROPY: measure entropy after burst */
                 double entropy_after = syntropy_measure(&ctx->syntracker, ctx->model,
                                                         ctx->tok, ctx->field, &docs);
                 syntropy_log_to_db(&ctx->syntracker, ctx->db,
                                    entropy_before, entropy_after, decision.action);
                 save_checkpoint(ctx->model, ctx->tok, NULL);
-                char note_buf[128];
-                snprintf(note_buf, sizeof(note_buf), "quantum_burst:%s", decision.action);
-                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, note_buf);
+
+                /* Record burst outcome for self-meta-learning */
+                syntropy_record_burst(&ctx->syntracker, decision.action, loss_before, loss_after);
+
+                /* Growth note includes delta-loss for the record */
+                char note_buf[192];
+                snprintf(note_buf, sizeof(note_buf),
+                         "quantum_burst:%s|dloss=%.4f", decision.action, delta_loss);
+                db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, loss_after, note_buf);
+                printf("[syntropy] burst complete: loss %.4f -> %.4f (delta=%.4f)\n",
+                       loss_before, loss_after, delta_loss);
             }
             pthread_mutex_unlock(&ctx->model->mu);
             free(pre_direction); free(post_direction);
