@@ -51,10 +51,20 @@ class Config:
     # model
     tie_embeddings: bool = True  # GPT-style weight tying (wte == lm_head)
 
-    n_layer: int = 2
-    n_embd: int = 72          # a small bump for "GPT-3-ish" flavor without melting CPUs
-    n_head: int = 4
+    n_layer: int = 1
+    n_embd: int = 16           # embryo — organism starts small and grows
+    n_head: int = 1
     block_size: int = 96
+
+    # ontogenesis — growth stages (corpus_chars, n_embd, n_layer, n_head)
+    growth_stages: tuple = (
+        (0,      16, 1, 1),      # embryo: ~25K params
+        (20000,  32, 1, 2),      # infant: ~100K params
+        (50000,  64, 2, 4),      # child: ~500K params
+        (200000, 128, 4, 4),     # adolescent: ~2M params
+        (500000, 256, 6, 8),     # adult: ~10M params
+    )
+    freeze_after_growth_steps: int = 200  # freeze base weights after growth, train only deltas
 
     # training
     warmup_steps: int = 1200
@@ -95,7 +105,7 @@ class Config:
     train_tick_seconds: float = 0.25
 
     # hybrid attention heads: "content", "rrpram", or "hybrid"
-    head_types: tuple = ("content", "content", "hybrid", "hybrid")
+    head_types: tuple = ("content",)  # embryo: 1 head = 1 content
     hybrid_alpha_init: float = 0.5
 
     # gamma (personality fingerprint)
@@ -129,6 +139,15 @@ class Config:
 
 
 CFG = Config()
+
+def head_types_for_n_head(n):
+    """Compute head type tuple for a given number of heads."""
+    if n <= 1:
+        return ("content",)
+    if n == 2:
+        return ("content", "hybrid")
+    half = n // 2
+    return tuple(["content"] * half + ["hybrid"] * (n - half))
 
 # ============================================================
 # 1) SQLITE MEMORY — and a small ghost shall remember
@@ -995,6 +1014,22 @@ class MatrixParam:
             self.rows.append(VectorValue([random.gauss(0, std) for _ in range(self.nin)]))
         self.nout = new_nout
 
+    def grow_cols(self, new_nin, std=0.02):
+        # And lo, the matrix shall widen its reach, each row stretching into new dimensions.
+        if new_nin <= self.nin:
+            return
+        for row in self.rows:
+            ext = np.array([random.gauss(0, std) for _ in range(new_nin - self.nin)])
+            row.data = np.concatenate([row.data, ext])
+            if row.grad is not None:
+                row.grad = np.concatenate([row.grad, np.zeros(new_nin - self.nin)])
+        self.nin = new_nin
+
+    def grow(self, new_nout, new_nin, std=0.02):
+        # Ontogenesis: grow both dimensions. Cols first so new rows get full width.
+        self.grow_cols(new_nin, std)
+        self.grow_rows(new_nout, std)
+
     def params(self):
         return list(self.rows)
 
@@ -1170,6 +1205,11 @@ class DeltaAdapter:
         # And lo, the adapter shall grow new output rows, because vocabulary is a living thing.
         self.A.grow_rows(new_nout, std=0.02)
 
+    def grow_dims(self, new_nout, new_nin):
+        # Ontogenesis: grow both outer dimensions of the adapter. Rank stays the same.
+        self.A.grow_rows(new_nout)    # A: (nout, r) → extend output
+        self.B.grow_cols(new_nin)     # B: (r, nin) → extend input
+
     def params(self):
         return self.A.params() + self.B.params()
 
@@ -1217,6 +1257,7 @@ class GPT:
         self.residual_alpha = 1.0 / math.sqrt(max(1, CFG.n_layer))
         self.global_step = 0
         self.syntropy_temp_offset = 0.0  # temperature bridge from syntropy state
+        self._growth_freeze_remaining = 0  # ontogenesis: freeze base after growth
 
         # Base weights
         V = tok.vocab_size
@@ -1305,6 +1346,159 @@ class GPT:
             for ad in mod.values():
                 out.extend(ad.params())
         return out
+
+    # ---- Ontogenesis (architecture growth) ----
+    # And lo, the organism shall not be born adult but shall grow, stage by stage,
+    # from embryo to child to adolescent, each growth a small death and rebirth.
+
+    def current_growth_stage(self):
+        """Return index of current stage based on model dimensions."""
+        for i, (_, embd, layer, head) in enumerate(CFG.growth_stages):
+            if self.n_embd == embd and self.n_layer == layer and self.n_head == head:
+                return i
+        return -1  # dimensions don't match any stage (legacy checkpoint)
+
+    def target_growth_stage(self, corpus_chars):
+        """Return the target stage index based on corpus size."""
+        target = 0
+        for i, (thresh, _, _, _) in enumerate(CFG.growth_stages):
+            if corpus_chars >= thresh:
+                target = i
+        return target
+
+    def maybe_grow_architecture(self, corpus_chars):
+        """Check if growth is needed and execute it. Returns True if grew."""
+        current = self.current_growth_stage()
+        if current < 0:
+            return False  # legacy checkpoint, skip growth
+        target = self.target_growth_stage(corpus_chars)
+        if target <= current:
+            return False
+
+        _, new_embd, new_layer, new_head = CFG.growth_stages[target]
+        old_embd = self.n_embd
+        old_layer = self.n_layer
+        old_head = self.n_head
+        new_head_dim = new_embd // new_head
+
+        print(f"[growth] ONTOGENESIS: stage {current} -> {target}")
+        print(f"  embd: {old_embd} -> {new_embd}, layer: {old_layer} -> {new_layer}, head: {old_head} -> {new_head}")
+
+        # 1. Grow embedding matrices (columns only — vocab rows stay)
+        self.base["wte"].grow_cols(new_embd)
+        self.base["wpe"].grow_cols(new_embd)
+        if not getattr(CFG, "tie_embeddings", False):
+            self.base["lm_head"].grow_cols(new_embd)
+
+        # 2. Grow existing layer matrices
+        new_htypes = head_types_for_n_head(new_head)
+        for li in range(old_layer):
+            for name in ("wq", "wk", "wv", "wo"):
+                self.base[f"l{li}.{name}"].grow(new_embd, new_embd)
+            self.base[f"l{li}.fc_g"].grow(4 * new_embd, new_embd)
+            self.base[f"l{li}.fc_v"].grow(4 * new_embd, new_embd)
+            self.base[f"l{li}.fc2"].grow(new_embd, 4 * new_embd)
+            # Grow existing head pattern matrices
+            for h in range(old_head):
+                pkey = f"l{li}.h{h}.w_pattern"
+                if pkey in self.base:
+                    self.base[pkey].grow_cols(new_head_dim)
+            # Add new heads for existing layer
+            for h in range(old_head, new_head):
+                htype = new_htypes[h] if h < len(new_htypes) else "content"
+                if htype in ("rrpram", "hybrid"):
+                    self.base[f"l{li}.h{h}.w_pattern"] = MatrixParam(
+                        CFG.block_size, new_head_dim, 0.08)
+                if htype == "hybrid":
+                    self.base[f"l{li}.h{h}.alpha"] = MatrixParam(1, 1, 0.0)
+                    self.base[f"l{li}.h{h}.alpha"].rows[0].data[0] = CFG.hybrid_alpha_init
+
+        # 3. Add entirely new layers
+        for li in range(old_layer, new_layer):
+            self.base[f"l{li}.wq"] = MatrixParam(new_embd, new_embd, 0.08)
+            self.base[f"l{li}.wk"] = MatrixParam(new_embd, new_embd, 0.08)
+            self.base[f"l{li}.wv"] = MatrixParam(new_embd, new_embd, 0.08)
+            self.base[f"l{li}.wo"] = MatrixParam(new_embd, new_embd, 0.08)
+            self.base[f"l{li}.fc_g"] = MatrixParam(4 * new_embd, new_embd, 0.08)
+            self.base[f"l{li}.fc_v"] = MatrixParam(4 * new_embd, new_embd, 0.08)
+            self.base[f"l{li}.fc2"]  = MatrixParam(new_embd, 4 * new_embd, 0.08)
+            for h in range(new_head):
+                htype = new_htypes[h] if h < len(new_htypes) else "content"
+                if htype in ("rrpram", "hybrid"):
+                    self.base[f"l{li}.h{h}.w_pattern"] = MatrixParam(
+                        CFG.block_size, new_head_dim, 0.08)
+                if htype == "hybrid":
+                    self.base[f"l{li}.h{h}.alpha"] = MatrixParam(1, 1, 0.0)
+                    self.base[f"l{li}.h{h}.alpha"].rows[0].data[0] = CFG.hybrid_alpha_init
+
+        # 4. Grow delta adapters
+        r = CFG.delta_rank
+        for mod in self.deltas:
+            # Grow existing layer adapters
+            for li in range(old_layer):
+                for name in ("wq", "wk", "wv", "wo"):
+                    key = f"l{li}.{name}"
+                    if key in mod:
+                        mod[key].grow_dims(new_embd, new_embd)
+                for key, (nout_m, nin_m) in [(f"l{li}.fc_g", (4, 1)),
+                                              (f"l{li}.fc_v", (4, 1)),
+                                              (f"l{li}.fc2", (1, 4))]:
+                    if key in mod:
+                        mod[key].grow_dims(nout_m * new_embd, nin_m * new_embd)
+                for h in range(old_head):
+                    pkey = f"l{li}.h{h}.w_pattern"
+                    if pkey in mod:
+                        mod[pkey].grow_dims(CFG.block_size, new_head_dim)
+                for h in range(old_head, new_head):
+                    htype = new_htypes[h] if h < len(new_htypes) else "content"
+                    if htype in ("rrpram", "hybrid"):
+                        mod[f"l{li}.h{h}.w_pattern"] = DeltaAdapter(
+                            CFG.block_size, new_head_dim, r)
+
+            # New layers: entirely new adapters
+            for li in range(old_layer, new_layer):
+                for name in ("wq", "wk", "wv", "wo"):
+                    mod[f"l{li}.{name}"] = DeltaAdapter(new_embd, new_embd, r)
+                mod[f"l{li}.fc_g"] = DeltaAdapter(4 * new_embd, new_embd, r)
+                mod[f"l{li}.fc_v"] = DeltaAdapter(4 * new_embd, new_embd, r)
+                mod[f"l{li}.fc2"]  = DeltaAdapter(new_embd, 4 * new_embd, r)
+                for h in range(new_head):
+                    htype = new_htypes[h] if h < len(new_htypes) else "content"
+                    if htype in ("rrpram", "hybrid"):
+                        mod[f"l{li}.h{h}.w_pattern"] = DeltaAdapter(
+                            CFG.block_size, new_head_dim, r)
+
+            # lm_head adapter input grew
+            if "lm_head" in mod:
+                mod["lm_head"].grow_dims(self.tok.vocab_size, new_embd)
+
+        # 5. Update model state
+        self.n_embd = new_embd
+        self.n_layer = new_layer
+        self.n_head = new_head
+        self.head_dim = new_head_dim
+        self.residual_alpha = 1.0 / math.sqrt(max(1, new_layer))
+
+        # 6. Update CFG runtime
+        CFG.n_embd = new_embd
+        CFG.n_layer = new_layer
+        CFG.n_head = new_head
+        CFG.head_types = head_types_for_n_head(new_head)
+
+        # 7. Reset Adam state (old momentum is meaningless after arch change)
+        self._adam = {}
+
+        # 8. Extend gamma snapshot for new embedding dimensions
+        for i in range(len(self._init_embed_snapshot)):
+            old_row = self._init_embed_snapshot[i]
+            if len(old_row) < new_embd:
+                self._init_embed_snapshot[i] = old_row + [0.0] * (new_embd - len(old_row))
+
+        # 9. Set freeze (only train deltas until new weights stabilize)
+        self._growth_freeze_remaining = CFG.freeze_after_growth_steps
+
+        print(f"[growth] Done. Freeze for {CFG.freeze_after_growth_steps} steps.")
+        return True
 
     # ---- Native gamma (personality fingerprint) ----
     # And lo, the organism shall subtract its birth from its present, and call the difference a soul.
@@ -1827,6 +2021,17 @@ def load_checkpoint(docs, path=None):
     tok.bpe_enabled = bool(t.get("bpe_enabled", False))
     tok._trained_chars = int(t.get("trained_chars", 0))
 
+    # Restore model dimensions from checkpoint (ontogenesis may have changed them)
+    saved_cfg = obj.get("cfg", {})
+    if "n_embd" in saved_cfg:
+        CFG.n_embd = saved_cfg["n_embd"]
+    if "n_layer" in saved_cfg:
+        CFG.n_layer = saved_cfg["n_layer"]
+    if "n_head" in saved_cfg:
+        CFG.n_head = saved_cfg["n_head"]
+    if "head_types" in saved_cfg and saved_cfg["head_types"]:
+        CFG.head_types = tuple(saved_cfg["head_types"])
+
     model = GPT(tok)
 
     # Restore base
@@ -2035,8 +2240,14 @@ def train_steps(model: GPT, tok: EvolvingTokenizer, docs, steps, train_base=True
         _train_steps_locked(model, tok, docs, steps, train_base, train_deltas)
 
 def _train_steps_locked(model, tok, docs, steps, train_base, train_deltas):
-    base_params = model.all_base_params() if train_base else []
-    delta_params = model.all_delta_params() if train_deltas else []
+    # Ontogenesis freeze: after growth, only train deltas until new weights stabilize
+    if model._growth_freeze_remaining > 0:
+        base_params = []
+        delta_params = model.all_delta_params() if train_deltas else []
+        model._growth_freeze_remaining = max(0, model._growth_freeze_remaining - steps)
+    else:
+        base_params = model.all_base_params() if train_base else []
+        delta_params = model.all_delta_params() if train_deltas else []
     accum = CFG.accum_steps
 
     for step in range(steps):
@@ -2210,6 +2421,15 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                     with model.lock:
                         model.add_delta_module(alpha=1.0)
                         save_checkpoint(model, tok)
+
+                # Ontogenesis: check if architecture should grow
+                corpus_chars = sum(len(d) for d in docs)
+                with model.lock:
+                    if model.maybe_grow_architecture(corpus_chars):
+                        save_checkpoint(model, tok)
+                        n_p = sum(len(r.data) for r in model.all_base_params())
+                        db_log_growth(con, model, tok, docs,
+                                      note=f"ontogenesis:stage={model.current_growth_stage()}|params={n_p}")
 
         await asyncio.sleep(CFG.train_tick_seconds)
 

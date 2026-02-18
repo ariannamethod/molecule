@@ -26,10 +26,12 @@ THIS IS:
 - Hybrid attention: Content + RRPRAM + learnable blend
 - Delta adapters (LoRA-style, never forgets)
 - Native gamma: personality fingerprint that grows from zero
-- BPE tokenizer that ONLY EXPANDS vocab (weights never invalidate)
+- Byte-level BPE tokenizer (GPT-3/4 style, any UTF-8 input)
+- Ontogenesis: organism grows from 25K embryo to 10M adult (5 stages)
 - Residual scaling: α = 1/√n_layer on attention + MLP (stable deep networks)
 - Global cosine LR with linear warmup (not per-burst hacks)
 - Gradient accumulation (effective batch scales with model growth)
+- Training efficiency memory (organism learns which strategies work for it)
 - Corpus field: speaks before it learns (trigram statistics)
 - QuantumBuffer: trains when it's ready, not when you tell it
 - SyntropyTracker: mathematical self-reasoning about its own becoming
@@ -50,10 +52,12 @@ What if instead of "train once, deploy", we had **continuous learning**?
 What if instead of ReLU, we had **SwiGLU**?  
 What if instead of sinusoidal positions, we had **RoPE**?  
 What if it never forgot? **Delta adapters.**  
-What if it could chat? **SQLite memory.**  
-What if it had multiple attention mechanisms? **Hybrid heads.**  
-What if it grew a personality from scratch? **Native gamma.**  
-What if it could speak before training? **Corpus field.**  
+What if it could chat? **SQLite memory.**
+What if it had multiple attention mechanisms? **Hybrid heads.**
+What if it grew a personality from scratch? **Native gamma.**
+What if it could speak before training? **Corpus field.**
+What if it started as a 25K embryo and grew to 10M? **Ontogenesis.**
+What if it could reason about its own learning? **SyntropyTracker.**
 What if it was *alive*?  
 
 So meet **molecule**. Thanks to Karpathy's microgpt, but this is not a fork.
@@ -419,14 +423,24 @@ class Config:
     db_path: str = "memory.sqlite3"
     max_corpus_lines: int = 8000
 
-    # Model
-    n_layer: int = 2
-    n_embd: int = 72           # Small but not stupid
-    n_head: int = 4
-    block_size: int = 96       # Context window
+    # Model (embryo defaults — organism grows via ontogenesis)
+    n_layer: int = 1
+    n_embd: int = 16           # Embryo stage
+    n_head: int = 1
+    block_size: int = 96
+
+    # Ontogenesis (growth stages)
+    growth_stages: tuple = (
+        (0, 16, 1, 1),        # embryo
+        (20000, 32, 1, 2),    # infant
+        (50000, 64, 2, 4),    # child
+        (200000, 128, 4, 4),  # adolescent
+        (500000, 256, 6, 8),  # adult
+    )
+    freeze_after_growth_steps: int = 200
 
     # Hybrid attention
-    head_types: tuple = ("content", "content", "hybrid", "hybrid")
+    head_types: tuple = ("content",)  # auto-adapts with growth
     hybrid_alpha_init: float = 0.5
 
     # Gamma (personality fingerprint)
@@ -555,34 +569,63 @@ Because atoms are micrograd. We build molecules.
 
 ---
 
-## The Future (v3 Roadmap)
+## v3 Status
 
-### Phase 2: Byte-Level Evolving Tokenizer
-The current tokenizer is char-level + word-based BPE (GPT-2 era). Phase 2 replaces it with **byte-level BPE** (GPT-3/4 style):
+### Phase 1: Training Upgrades — DONE
+- Real SiLU activation in SwiGLU (LLaMA-exact, not ReLU)
+- Residual scaling: `α = 1/√n_layer` on attention + MLP
+- Global cosine LR with linear warmup
+- Gradient accumulation (configurable, ready for growth)
+- BPE threshold lowered (activates on first launch)
+
+### Phase 1.5: Self-Awareness Expansion — DONE
+- Training efficiency memory: organism remembers which learning strategies work for *it*
+- Temperature bridge: syntropy trend shifts generation temp ±5% (ordering → confident, disordering → exploratory)
+- Quick loss measurement for before/after burst comparison
+- Self-meta-learning: actions that historically increase loss get downgraded
+
+### Phase 2: Byte-Level BPE Tokenizer — DONE
+GPT-3/4 style tokenizer replacing char-level + word-based BPE:
 - **Bootstrap**: 256 byte tokens + BOS/EOS/PAD = 259 initial vocab (language-agnostic)
-- **Pre-segmentation**: split by Unicode category (letters / digits / whitespace / punctuation) before merging — no ugly cross-boundary tokens
-- **Stream BPE**: merges operate on byte sequences within segments, not word-split with `</w>`
-- Any valid UTF-8 input works: ASCII, Cyrillic, CJK, emoji — same algorithm, same code
+- **Pre-segmentation**: split by Unicode category (letters / digits / whitespace / punctuation)
+- **Stream BPE**: merges on byte sequences within segments, `+` separator (e.g. `0x48+0x65`)
+- Full UTF-8 roundtrip: ASCII, Cyrillic, CJK, emoji — same algorithm, same code
 
-### Phase 3: Growing Architecture (Ontogenesis)
-The model is currently born at fixed size (72 dims, 2 layers). Phase 3 makes it **grow with its corpus**:
+### Phase 3A: Growing Architecture (Ontogenesis) — DONE (Python)
+The organism starts as an embryo and grows through 5 stages:
 ```
-Stage     Corpus      Dims  Layers  Heads  ~Params
-embryo    0           16    1       1      ~25K
-infant    20KB        32    1       2      ~100K
-child     50KB        64    2       4      ~500K
-adolescent 200KB      128   4       4      ~2M
-adult     500KB       256   6       8      ~10M
+Stage       Corpus    Dims  Layers  Heads  ~Params
+embryo      0         16    1       1      ~25K
+infant      20KB      32    1       2      ~100K
+child       50KB      64    2       4      ~500K
+adolescent  200KB     128   4       4      ~2M
+adult       500KB     256   6       8      ~10M
 ```
-Old weights copy into the top-left corner of new matrices. New dimensions initialize with small noise. Adam state resets. The organism literally **grows up**.
 
-This is why residual scaling and cosine LR exist — they make architecture growth stable.
+Key mechanics:
+- Old weights copy into top-left corner of new matrices (knowledge preserved)
+- New dimensions initialize with small gaussian noise
+- `grow_cols()` + `grow_rows()` = `grow()` on MatrixParam
+- Delta adapters grow via `grow_dims()` (rank unchanged)
+- Adam state resets (old momentum meaningless after arch change)
+- Freeze period: base weights frozen for 200 steps after growth (only deltas train)
+- Gamma snapshot extended for new embedding dimensions
+- Head types auto-adapt: 1→(content), 2→(content,hybrid), 4→(2c,2h), 8→(4c,4h)
+
+### Phase 3B: Mitosis & Ecology — IN PROGRESS
+When the adult organism is overloaded, it **divides**:
+- SyntropyTracker detects sustained high entropy + falling syntropy → "divide" action
+- Parent spawns child process at infant stage with inherited training memory
+- Both organisms train independently on shared corpus
+- Swarm registry (`~/.molecule/swarm/mesh.db`) tracks all living instances
+- Generational knowledge: child inherits parent's burst_history (avoids same mistakes)
+- Cooldown timer prevents runaway mitosis
 
 ### And Beyond
+- **Inference routing** between organisms (lowest entropy answers)
 - **Gamma export/import** (personality transfer between molecules)
 - **Speculative decoding** (draft + verify for speed)
 - **Mixture of Experts** (delta routing)
-- **Retrieval augmentation** (SQLite + embeddings)
 
 
 ---

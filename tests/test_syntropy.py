@@ -58,7 +58,7 @@ class TestFieldDeviation(unittest.TestCase):
         """Field deviation should change after training moves the weights."""
         model, tok, docs, field = _make_model_and_field()
         dev_before = model.compute_field_deviation(tok, field, docs)
-        train_steps(model, tok, docs, steps=30, train_base=True, train_deltas=True)
+        train_steps(model, tok, docs, steps=100, train_base=True, train_deltas=True)
         dev_after = model.compute_field_deviation(tok, field, docs)
         # They should differ (training moved weights)
         self.assertNotAlmostEqual(dev_before, dev_after, places=2)
