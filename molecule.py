@@ -1185,6 +1185,7 @@ class GPT:
         self.lock = threading.Lock()
         self.residual_alpha = 1.0 / math.sqrt(max(1, CFG.n_layer))
         self.global_step = 0
+        self.syntropy_temp_offset = 0.0  # temperature bridge from syntropy state
 
         # Base weights
         V = tok.vocab_size
@@ -1645,6 +1646,20 @@ class GPT:
         with self.lock, no_grad():
             return self._generate_sentence_impl(prompt_text)
 
+    def quick_loss(self, tok, docs, n=4):
+        """Fast loss on a few random docs without backward. For self-meta-learning."""
+        if not docs:
+            return 0.0
+        with no_grad():
+            total = 0.0
+            for _ in range(n):
+                doc = random.choice(docs)
+                ids = tok.encode(doc)
+                if len(ids) > 1:
+                    loss = self.loss_on_sequence(ids)
+                    total += loss.data
+            return total / n
+
     def _generate_sentence_impl(self, prompt_text=""):
         if prompt_text:
             ids = self.tok.encode(prompt_text)[:-1]
@@ -1666,8 +1681,8 @@ class GPT:
             pos = min(len(ids) - 1, self.block_size - 1)
             logits = self.forward_step(cur, pos, keys, values)
 
-            # entropy-adaptive temperature
-            base_temp = float(CFG.temperature)
+            # entropy-adaptive temperature + syntropy bridge
+            base_temp = float(CFG.temperature) + self.syntropy_temp_offset
             if base_temp <= 1e-6:
                 base_temp = 1e-6
             raw = logits.data
@@ -1846,6 +1861,20 @@ class SyntropyTracker:
         self.purpose_magnitude = 0.0  # strength of current learning direction
         self.purpose_alignment = 0.0  # cosine(purpose, gamma)
         self.last_action = "none"     # what was decided last time
+        self.burst_history = []       # last 16 burst outcomes — training efficiency memory
+
+    def record_burst(self, action, loss_before, loss_after):
+        """Log a burst outcome for self-meta-learning."""
+        self.burst_history.append({"action": action, "loss_before": loss_before, "loss_after": loss_after})
+        if len(self.burst_history) > 16:
+            self.burst_history = self.burst_history[-16:]
+
+    def action_effectiveness(self, action):
+        """Mean loss delta for a given action. Negative = good (loss went down)."""
+        deltas = [b["loss_after"] - b["loss_before"] for b in self.burst_history if b["action"] == action]
+        if not deltas:
+            return 0.0, 0
+        return sum(deltas) / len(deltas), len(deltas)
 
     def measure(self, model, tok, field, docs):
         """Take all measurements. This is the organism looking at itself
@@ -1883,6 +1912,8 @@ class SyntropyTracker:
 
         # Default: steady state
         lr_multiplier = 1.0
+        temp_offset = 0.0
+        accum_override = 0
         delta_grow_override = None
         action = "steady"
 
@@ -1890,35 +1921,56 @@ class SyntropyTracker:
         if (self.syntropy_trend > 0.01 and
                 CFG.field_deviation_floor < self.field_deviation < CFG.field_deviation_ceiling):
             lr_multiplier = CFG.syntropy_lr_boost
+            temp_offset = -0.05  # more confident when organizing
             if self.purpose_alignment > 0.3:
                 delta_grow_override = CFG.syntropy_delta_grow_boost
-                action = "amplify"  # everything aligned, push harder
+                accum_override = 2  # stable gradient when everything aligned
+                action = "amplify"
             else:
-                action = "boost"  # syntropy good but purpose drifting, boost gently
+                action = "boost"
 
         # CASE 2: Syntropy falling = dissolving, slow down
         elif self.syntropy_trend < -0.01:
             lr_multiplier = CFG.syntropy_lr_dampen
-            action = "dampen"  # losing order, reduce learning rate
+            temp_offset = 0.05  # more exploratory when disordering
+            action = "dampen"
 
         # CASE 3: Field deviation too high = hallucinating
         elif self.field_deviation > CFG.field_deviation_ceiling:
             lr_multiplier = CFG.syntropy_lr_dampen
-            action = "ground"  # too far from corpus, pull back
+            temp_offset = -0.05  # focus when hallucinating
+            action = "ground"
 
         # CASE 4: Field deviation too low = parroting
         elif self.field_deviation < CFG.field_deviation_floor:
             lr_multiplier = CFG.syntropy_lr_boost
-            action = "explore"  # too close to corpus, push out
+            temp_offset = 0.05  # explore when parroting
+            action = "explore"
 
         # CASE 5: Purpose opposes gamma = identity crisis
         if self.purpose_alignment < -0.3:
             lr_multiplier *= 0.5
-            action = "realign"  # learning against identity, slow down hard
+            temp_offset = 0.0
+            action = "realign"
+
+        # SELF-META-LEARNING: check if this action historically hurts
+        if len(self.burst_history) >= 4:
+            eff, count = self.action_effectiveness(action)
+            if count >= 2 and eff > 0.05:
+                # This action consistently makes loss WORSE — downgrade
+                if action == "amplify":
+                    action = "boost"
+                    accum_override = 0
+                    delta_grow_override = None
+                elif action in ("boost", "explore"):
+                    lr_multiplier = 1.0
+                    action = "steady"
 
         self.last_action = action
         return {
             "lr_multiplier": lr_multiplier,
+            "temp_offset": temp_offset,
+            "accum_override": accum_override,
             "delta_grow_override": delta_grow_override,
             "action": action,
         }
@@ -2072,17 +2124,34 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                     pre_direction, pre_mag = model.gamma_contrastive_projection()
                     delta_snap = model.snapshot_deltas()
 
-                # Apply syntropy-adjusted learning rate
+                # Apply syntropy-adjusted learning rate + accum override
                 original_lr = CFG.learning_rate
                 CFG.learning_rate = original_lr * lr_mul
+                original_accum = CFG.accum_steps
+                if decision.get("accum_override", 0) > 0:
+                    CFG.accum_steps = decision["accum_override"]
+
+                # Update temperature bridge
+                model.syntropy_temp_offset = decision.get("temp_offset", 0.0)
+
+                # Measure loss before burst for self-meta-learning
+                with model.lock:
+                    loss_before = model.quick_loss(tok, docs, 4)
 
                 train_base = not CFG.freeze_base_after_warmup
                 train_steps(model, tok, docs, CFG.micro_steps,
                             train_base=train_base, train_deltas=True)
 
-                CFG.learning_rate = original_lr  # restore
+                CFG.learning_rate = original_lr   # restore
+                CFG.accum_steps = original_accum  # restore
 
                 with model.lock:
+                    # Measure loss after burst
+                    loss_after = model.quick_loss(tok, docs, 4)
+
+                    # SELF-META-LEARNING: record what this burst did
+                    syntracker.record_burst(action, loss_before, loss_after)
+
                     # IMMUNE SYSTEM: check drift after burst
                     drift_cos = model.gamma_drift_check(pre_direction, pre_mag)
                     if drift_cos < CFG.noise_drift_threshold:
@@ -2096,7 +2165,8 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer):
                         entropy_after = post_metrics["entropy"]
                         syntracker.log_to_db(con, entropy_before, entropy_after, action)
                         save_checkpoint(model, tok)
-                        db_log_growth(con, model, tok, docs, note=f"quantum_burst:{action}")
+                        db_log_growth(con, model, tok, docs,
+                                      note=f"quantum_burst:{action}|Δloss={loss_after-loss_before:.4f}")
 
                 qbuf.reset()
 

@@ -1372,8 +1372,9 @@ type GPT struct {
 
 	InitEmbedSnapshot [][]float64 // snapshot of initial embeddings for gamma
 
-	residualAlpha float64 // 1/sqrt(nLayer) scaling for residual connections
-	globalStep    int     // global training step counter (for cosine LR + checkpoint)
+	residualAlpha    float64 // 1/sqrt(nLayer) scaling for residual connections
+	globalStep       int     // global training step counter (for cosine LR + checkpoint)
+	syntropyTempOff  float64 // temperature offset from syntropy state (-0.05 to +0.05)
 
 	mu sync.Mutex // protects model during concurrent access
 }
@@ -2177,6 +2178,26 @@ func (gpt *GPT) LossOnBatch(batchIDs [][]int) *Scalar {
 	return total.MulF(1.0 / float64(len(batchIDs)))
 }
 
+// QuickLoss computes average loss on a few random docs without backward.
+// Used for self-meta-learning: measure loss before/after burst.
+func (gpt *GPT) QuickLoss(tok *EvolvingTokenizer, docs []string, n int) float64 {
+	if len(docs) == 0 {
+		return 0
+	}
+	gradEnabled = false
+	defer func() { gradEnabled = true }()
+	total := 0.0
+	for i := 0; i < n; i++ {
+		doc := docs[rand.Intn(len(docs))]
+		ids := tok.Encode(doc)
+		if len(ids) > 1 {
+			loss := gpt.LossOnSequence(ids)
+			total += loss.Data
+		}
+	}
+	return total / float64(n)
+}
+
 // GenerateSentence generates text from an optional prompt.
 // And lo, generation shall aim for a sentence, not a random cough.
 func (gpt *GPT) GenerateSentence(promptText string) string {
@@ -2224,8 +2245,8 @@ func (gpt *GPT) GenerateSentence(promptText string) string {
 		}
 		logits := gpt.ForwardStep(cur, pos, keys, values)
 
-		// Entropy-adaptive temperature
-		baseTemp := CFG.Temperature
+		// Entropy-adaptive temperature + syntropy bridge
+		baseTemp := CFG.Temperature + gpt.syntropyTempOff
 		if baseTemp <= 1e-6 {
 			baseTemp = 1e-6
 		}
@@ -3173,6 +3194,13 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 // And lo, the organism shall not merely track its changes,
 // but reason mathematically about whether it is becoming more itself.
 
+// BurstRecord stores what happened after a training burst — for self-meta-learning.
+type BurstRecord struct {
+	Action     string
+	LossBefore float64
+	LossAfter  float64
+}
+
 // SyntropyTracker is the mathematical self-reasoning engine.
 // Tracks entropy trend, field deviation, purpose alignment.
 // Makes decisions about learning direction — not just 'did I learn?'
@@ -3184,6 +3212,7 @@ type SyntropyTracker struct {
 	PurposeMagnitude float64   // strength of current learning direction
 	PurposeAlignment float64   // cosine(purpose, gamma)
 	LastAction       string    // what was decided last time
+	BurstHistory     []BurstRecord // last 16 burst outcomes — training efficiency memory
 }
 
 // NewSyntropyTracker creates a new tracker with sane defaults.
@@ -3192,6 +3221,32 @@ func NewSyntropyTracker() *SyntropyTracker {
 	return &SyntropyTracker{
 		LastAction: "none",
 	}
+}
+
+// RecordBurst logs a burst outcome for self-meta-learning.
+// The organism remembers what worked and what didn't.
+func (st *SyntropyTracker) RecordBurst(action string, lossBefore, lossAfter float64) {
+	st.BurstHistory = append(st.BurstHistory, BurstRecord{action, lossBefore, lossAfter})
+	if len(st.BurstHistory) > 16 {
+		st.BurstHistory = st.BurstHistory[len(st.BurstHistory)-16:]
+	}
+}
+
+// ActionEffectiveness returns the mean loss delta for a given action type.
+// Negative = good (loss went down). Positive = bad (loss went up).
+func (st *SyntropyTracker) ActionEffectiveness(action string) (float64, int) {
+	sum := 0.0
+	count := 0
+	for _, br := range st.BurstHistory {
+		if br.Action == action {
+			sum += br.LossAfter - br.LossBefore
+			count++
+		}
+	}
+	if count == 0 {
+		return 0, 0
+	}
+	return sum / float64(count), count
 }
 
 // SyntropyMetrics holds the result of a syntropy measurement pass.
@@ -3247,8 +3302,11 @@ func (st *SyntropyTracker) Measure(model *GPT, tok *EvolvingTokenizer, field *Co
 }
 
 // SyntropyDecision holds the outcome of the organism's mathematical self-reasoning.
+// Not just LR anymore — the organism modulates its entire behavior.
 type SyntropyDecision struct {
 	LRMultiplier      float64
+	TempOffset        float64  // added to generation temperature (-0.05 to +0.05)
+	AccumOverride     int      // 0 = no override, >0 = use this accum_steps for this burst
 	DeltaGrowOverride *float64 // nil = no override
 	Action            string
 }
@@ -3259,6 +3317,8 @@ type SyntropyDecision struct {
 func (st *SyntropyTracker) DecideAction() SyntropyDecision {
 	// Default: steady state
 	lrMultiplier := 1.0
+	tempOffset := 0.0
+	accumOverride := 0
 	var deltaGrowOverride *float64
 	action := "steady"
 
@@ -3267,39 +3327,63 @@ func (st *SyntropyTracker) DecideAction() SyntropyDecision {
 		st.FieldDeviation > CFG.FieldDeviationFloor &&
 		st.FieldDeviation < CFG.FieldDeviationCeiling {
 		lrMultiplier = CFG.SyntropyLRBoost
+		tempOffset = -0.05 // more confident when organizing
 		if st.PurposeAlignment > 0.3 {
 			boost := CFG.SyntropyDeltaGrowBoost
 			deltaGrowOverride = &boost
-			action = "amplify" // everything aligned, push harder
+			accumOverride = 2 // stable gradient when everything aligned
+			action = "amplify"
 		} else {
-			action = "boost" // syntropy good but purpose drifting, boost gently
+			action = "boost"
 		}
 
 		// CASE 2: Syntropy falling = dissolving, slow down
 	} else if st.SyntropyTrend < -0.01 {
 		lrMultiplier = CFG.SyntropyLRDampen
-		action = "dampen" // losing order, reduce learning rate
+		tempOffset = 0.05 // more exploratory when disordering
+		action = "dampen"
 
 		// CASE 3: Field deviation too high = hallucinating
 	} else if st.FieldDeviation > CFG.FieldDeviationCeiling {
 		lrMultiplier = CFG.SyntropyLRDampen
-		action = "ground" // too far from corpus, pull back
+		tempOffset = -0.05 // focus when hallucinating
+		action = "ground"
 
 		// CASE 4: Field deviation too low = parroting
 	} else if st.FieldDeviation < CFG.FieldDeviationFloor {
 		lrMultiplier = CFG.SyntropyLRBoost
-		action = "explore" // too close to corpus, push out
+		tempOffset = 0.05 // explore when parroting
+		action = "explore"
 	}
 
 	// CASE 5: Purpose opposes gamma = identity crisis
 	if st.PurposeAlignment < -0.3 {
 		lrMultiplier *= 0.5
-		action = "realign" // learning against identity, slow down hard
+		tempOffset = 0.0 // neutral temp during identity crisis
+		action = "realign"
+	}
+
+	// SELF-META-LEARNING: check if this action historically hurts
+	if len(st.BurstHistory) >= 4 {
+		eff, count := st.ActionEffectiveness(action)
+		if count >= 2 && eff > 0.05 {
+			// This action has been consistently making loss WORSE — downgrade
+			if action == "amplify" {
+				action = "boost"
+				accumOverride = 0
+				deltaGrowOverride = nil
+			} else if action == "boost" || action == "explore" {
+				lrMultiplier = 1.0 // back to steady instead of boosting
+				action = "steady"
+			}
+		}
 	}
 
 	st.LastAction = action
 	return SyntropyDecision{
 		LRMultiplier:      lrMultiplier,
+		TempOffset:        tempOffset,
+		AccumOverride:     accumOverride,
 		DeltaGrowOverride: deltaGrowOverride,
 		Action:            action,
 	}
@@ -3456,16 +3540,33 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 			deltaSnap := model.SnapshotDeltas()
 			model.mu.Unlock()
 
-			// Apply syntropy-adjusted learning rate
+			// Apply syntropy-adjusted learning rate + accum override
 			originalLR := CFG.LearningRate
 			CFG.LearningRate = originalLR * lrMul
+			originalAccum := CFG.AccumSteps
+			if decision.AccumOverride > 0 {
+				CFG.AccumSteps = decision.AccumOverride
+			}
+
+			// Update temperature bridge (thread-safe via model lock already released)
+			model.syntropyTempOff = decision.TempOffset
+
+			// Measure loss before burst for self-meta-learning
+			lossBefore := model.QuickLoss(tok, docs, 4)
 
 			trainBase := !CFG.FreezeBaseAfterWarm
 			trainSteps(model, tok, docs, CFG.MicroSteps, trainBase, true)
 
-			CFG.LearningRate = originalLR // restore, like a gentleman
+			CFG.LearningRate = originalLR   // restore
+			CFG.AccumSteps = originalAccum  // restore
 
 			model.mu.Lock()
+			// Measure loss after burst
+			lossAfter := model.QuickLoss(tok, docs, 4)
+
+			// SELF-META-LEARNING: record what this burst did
+			syntracker.RecordBurst(action, lossBefore, lossAfter)
+
 			// IMMUNE SYSTEM: check drift after burst
 			driftCos := model.GammaDriftCheck(preDirection, preMag)
 			if driftCos < CFG.NoiseDriftThreshold {
@@ -3479,7 +3580,8 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 				entropyAfter := postMetrics.Entropy
 				syntracker.LogToDB(db, entropyBefore, entropyAfter, action)
 				SaveCheckpoint(model, tok, "")
-				dbLogGrowth(db, model, tok, docs, 0.0, fmt.Sprintf("quantum_burst:%s", action))
+				note := fmt.Sprintf("quantum_burst:%s|Δloss=%.4f", action, lossAfter-lossBefore)
+				dbLogGrowth(db, model, tok, docs, 0.0, note)
 			}
 			model.mu.Unlock()
 
