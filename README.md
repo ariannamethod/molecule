@@ -50,12 +50,10 @@ What if it never forgot? **Delta adapters.**
 What if it could chat? **SQLite memory.**  
 What if it had multiple attention mechanisms? **Hybrid heads.**  
 What if it grew a personality from scratch? **Native gamma.**  
-What if it could speak before training? **Corpus field.**
-What if it could reason about its own learning direction? **Syntropy tracker.**
-What if it ran in the browser with zero dependencies? **molecule.js.**
-What if it was *alive*?
+What if it could speak before training? **Corpus field.**  
+What if it was *alive*?  
 
-So I built it. **molecule.** Thanks to Karpathy's microgpt, but this is not a fork.
+So meet **molecule**. Thanks to Karpathy's microgpt, but this is not a fork.
 
 ---
 
