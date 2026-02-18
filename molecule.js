@@ -1910,7 +1910,7 @@ class GPT {
         for (let li = 0; li < this.nLayer; li++) { keys.push([]); values.push([]); }
 
         // build cache from prompt (stop before last token so sampling loop handles it)
-        for (let pos = 0; pos < Math.min(ids.length - 1, this.blockSize); pos++) {
+        for (let pos = 0; pos < Math.min(Math.max(ids.length - 1, 0), this.blockSize); pos++) {
             this.forwardStep(ids[pos], pos, keys, values);
         }
 
