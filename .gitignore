@@ -60,6 +60,7 @@ molecule_ckpt.json
 
 # Go build artifacts
 molecule_bin
+/molecule
 
 # IDE
 .idea/
