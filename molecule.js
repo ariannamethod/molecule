@@ -263,7 +263,13 @@ class MoleculeDB {
             const s = this._tx("kv", "readwrite");
             const req = s.put({ key, value });
             req.onsuccess = () => resolve();
-            req.onerror = () => reject(req.error);
+            req.onerror = () => {
+                const err = req.error;
+                if (err && err.name === "QuotaExceededError") {
+                    console.error(`[molecule] Storage quota exceeded while saving "${key}". Try clearing old data.`);
+                }
+                reject(err);
+            };
         });
     }
 
@@ -409,7 +415,9 @@ async function updateReservoirCorpus() {
     const added = Math.max(0, after - before);
 
     await saveCorpusToDB(_corpusLines);
-    await DB.addCorpusEvent(added, `reservoir_update +${newSents.length} sents`);
+    if (added > 0) {
+        await DB.addCorpusEvent(added, `reservoir_update +${newSents.length} sents`);
+    }
     return added;
 }
 
@@ -1371,7 +1379,6 @@ class GPT {
         this.nHead = CFG.nHead;
         this.headDim = Math.floor(CFG.nEmbd / CFG.nHead);
         this.blockSize = CFG.blockSize;
-        this._locked = false; // simple lock for browser (no real threading)
 
         // Base weights
         const V = tok.vocabSize;
@@ -1902,8 +1909,8 @@ class GPT {
         const keys = []; const values = [];
         for (let li = 0; li < this.nLayer; li++) { keys.push([]); values.push([]); }
 
-        // build cache from prompt
-        for (let pos = 0; pos < Math.min(ids.length, this.blockSize); pos++) {
+        // build cache from prompt (stop before last token so sampling loop handles it)
+        for (let pos = 0; pos < Math.min(Math.max(ids.length - 1, 0), this.blockSize); pos++) {
             this.forwardStep(ids[pos], pos, keys, values);
         }
 
@@ -2632,6 +2639,15 @@ if (typeof document !== "undefined") {
     } else {
         awaken();
     }
+}
+
+// And lo, if summoned from Node, the organism shall reveal its organs for testing.
+if (typeof module !== "undefined" && module.exports) {
+    module.exports = {
+        CFG, softmaxProbsFloat, topKTopPSample, VectorValue, ScalarValue,
+        backward, withNoGrad, MatrixParam, EvolvingTokenizer, GPT,
+        extractCandidateSentences, reservoirMixKeep, normalizeText, rng,
+    };
 }
 
 // And lo, the IIFE shall close, and the organism shall be sealed.

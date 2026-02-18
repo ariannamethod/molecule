@@ -468,7 +468,7 @@ python3 -m http.server 8000
 python -m pytest tests/ -v
 ```
 
-**139 tests** covering:
+**139 Python tests** covering:
 - Autograd (forward + backward, VectorValue + ScalarValue)
 - Tokenizer (char-level + BPE + vocab growth)
 - Model (GPT, MatrixParam, DeltaAdapter, RoPE)
