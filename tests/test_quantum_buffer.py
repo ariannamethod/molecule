@@ -6,7 +6,7 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from molecule import QuantumBuffer, EvolvingTokenizer, CFG
+from molequla import QuantumBuffer, EvolvingTokenizer, CFG
 
 
 def _make_tok():

@@ -1,8 +1,8 @@
 /*
- * molecule.c
+ * molequla.c
  * A dependency-free, single-file, continually-learning GPT organism in pure C.
  *
- * Compile: gcc -O2 -o molecule molecule.c -lsqlite3 -lpthread -lm
+ * Compile: gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm
  *
  * In the beginning there was nonames.txt.
  * And it was good. Mostly. Sometimes cursed.
@@ -120,7 +120,7 @@ typedef struct {
 static Config CFG = {
     .corpus_path = "nonames.txt",
     .db_path = "memory.sqlite3",
-    .ckpt_path = "molecule.ckpt",
+    .ckpt_path = "molequla.ckpt",
     .max_corpus_lines = 8000,
     .max_line_chars = 240,
     .min_new_chars = 480,
@@ -3788,7 +3788,7 @@ static char *build_prompt(sqlite3 *db, const char *user_text) {
 /* And lo, the first cell shall call into the void and hear only silence.
  * But the second shall call and hear an answer. */
 
-#define SWARM_DIR_SUFFIX "/.molecule/swarm"
+#define SWARM_DIR_SUFFIX "/.molequla/swarm"
 
 typedef struct {
     char organism_id[64];
@@ -3976,7 +3976,7 @@ static void perform_mitosis(GPT *g, EvolvingTokenizer *tok, sqlite3 *db,
     const char *home = getenv("HOME");
     if (!home) home = "/tmp";
     char child_dir[512];
-    snprintf(child_dir, sizeof(child_dir), "%s/.molecule/%s", home, child_id);
+    snprintf(child_dir, sizeof(child_dir), "%s/.molequla/%s", home, child_id);
     _swarm_mkdirp(child_dir);
 
     /* Save parent checkpoint for child */
@@ -3991,7 +3991,7 @@ static void perform_mitosis(GPT *g, EvolvingTokenizer *tok, sqlite3 *db,
     if (bf) {
         char child_db[512], child_ckpt[512];
         snprintf(child_db, sizeof(child_db), "%s/memory.sqlite3", child_dir);
-        snprintf(child_ckpt, sizeof(child_ckpt), "%s/molecule.ckpt", child_dir);
+        snprintf(child_ckpt, sizeof(child_ckpt), "%s/molequla.ckpt", child_dir);
         fprintf(bf, "{\"organism_id\":\"%s\",\"parent_id\":\"%s\","
                 "\"corpus_path\":\"%s\",\"db_path\":\"%s\",\"ckpt_path\":\"%s\"}\n",
                 child_id, sw->organism_id, CFG.corpus_path, child_db, child_ckpt);
@@ -4355,7 +4355,7 @@ int main(int argc, char **argv) {
     pthread_t trainer_tid;
     pthread_create(&trainer_tid, NULL, background_trainer, &tctx);
 
-    printf("molecule is alive. Type and press Enter. Ctrl+C to exit.\n\n");
+    printf("molequla is alive. Type and press Enter. Ctrl+C to exit.\n\n");
 
     char input[1024];
     while (1) {

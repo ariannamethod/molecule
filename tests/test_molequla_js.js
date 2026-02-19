@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * Tests for the JavaScript implementation (molecule.js).
+ * Tests for the JavaScript implementation (molequla.js).
  *
  * Mirrors the Python test suite structure — autograd, tokenizer, model,
  * sampling, and the specific fixes for the Copilot/Codex review items.
  *
- * Run:  node tests/test_molecule_js.js
+ * Run:  node tests/test_molequla_js.js
  */
 
 "use strict";
 
 const path = require("path");
-const m = require(path.join(__dirname, "..", "molecule.js"));
+const m = require(path.join(__dirname, "..", "molequla.js"));
 
 const {
     CFG, softmaxProbsFloat, topKTopPSample, VectorValue, ScalarValue,
@@ -336,7 +336,7 @@ test("withNoGrad: grad re-enabled after", () => {
 // ──────────────────────────────────────────────
 
 console.log(`\n${"=".repeat(50)}`);
-console.log(`  molecule.js tests: ${_passed} passed, ${_failed} failed`);
+console.log(`  molequla.js tests: ${_passed} passed, ${_failed} failed`);
 console.log(`${"=".repeat(50)}`);
 
 if (_failures.length > 0) {

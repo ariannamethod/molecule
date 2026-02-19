@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from molecule import (
+from molequla import (
     GPT, EvolvingTokenizer, CooccurField, SyntropyTracker,
     train_steps, init_db, CFG, no_grad
 )
@@ -17,7 +17,7 @@ import numpy as np
 def _make_model_and_field():
     docs = [
         "H: Who are you?",
-        "A: I am molecule.",
+        "A: I am molequla.",
         "H: What is syntropy?",
         "A: The opposite of decay.",
         "H: How do you learn?",

@@ -13,7 +13,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from molecule import VectorValue, ScalarValue, backward
+from molequla import VectorValue, ScalarValue, backward
 
 
 class TestVectorValue(unittest.TestCase):

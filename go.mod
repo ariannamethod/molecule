@@ -1,4 +1,4 @@
-module github.com/ariannamethod/molecule
+module github.com/ariannamethod/molequla
 
 go 1.21
 

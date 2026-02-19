@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from molecule import GPT, EvolvingTokenizer, save_checkpoint, load_checkpoint
+from molequla import GPT, EvolvingTokenizer, save_checkpoint, load_checkpoint
 
 
 class TestCheckpointing(unittest.TestCase):

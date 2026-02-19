@@ -1,6 +1,6 @@
-// molecule.go
+// molequla.go
 // A dependency-free*, single-file, goroutine-powered, continually-learning GPT organism.
-// Go port of molecule.py — same architecture, same checkpoint format, 100x faster.
+// Go port of molequla.py — same architecture, same checkpoint format, 100x faster.
 //
 // * "dependency-free" = no PyTorch, no numpy, no C. One Go dep: modernc.org/sqlite (pure Go).
 //
@@ -138,7 +138,7 @@ type Config struct {
 var CFG = Config{
 	CorpusPath:           "nonames.txt",
 	DBPath:               "memory.sqlite3",
-	CkptPath:             "molecule_ckpt.json",
+	CkptPath:             "molequla_ckpt.json",
 	MaxCorpusLines:       8000,
 	MaxLineChars:         240,
 	MinNewChars:          480,
@@ -3996,9 +3996,9 @@ func (st *SyntropyTracker) shouldHibernate() bool {
 // And lo, the first cell shall call into the void and hear only silence.
 // But the second shall call and hear an answer.
 
-var swarmDir = filepath.Join(os.Getenv("HOME"), ".molecule", "swarm")
+var swarmDir = filepath.Join(os.Getenv("HOME"), ".molequla", "swarm")
 
-// SwarmRegistry discovers and tracks other molecule instances via shared SQLite.
+// SwarmRegistry discovers and tracks other molequla instances via shared SQLite.
 type SwarmRegistry struct {
 	OrganismID string
 	PidFile    string
@@ -4145,7 +4145,7 @@ func (sr *SwarmRegistry) Unregister() {
 // performMitosis divides the organism. Parent continues. Child starts at infant stage.
 func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *SwarmRegistry, syntracker *SyntropyTracker) (string, error) {
 	childID := fmt.Sprintf("org_%d_%d", time.Now().Unix(), rand.Intn(9000)+1000)
-	childDir := filepath.Join(os.Getenv("HOME"), ".molecule", childID)
+	childDir := filepath.Join(os.Getenv("HOME"), ".molequla", childID)
 	if err := os.MkdirAll(childDir, 0755); err != nil {
 		return "", err
 	}
@@ -4162,7 +4162,7 @@ func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *Swarm
 		"parent_id":     swarm.OrganismID,
 		"corpus_path":   CFG.CorpusPath,
 		"db_path":       filepath.Join(childDir, "memory.sqlite3"),
-		"ckpt_path":     filepath.Join(childDir, "molecule_ckpt.json"),
+		"ckpt_path":     filepath.Join(childDir, "molequla_ckpt.json"),
 		"burst_history": syntracker.BurstHistory,
 	}
 	birthPath := filepath.Join(childDir, "birth.json")
@@ -4635,7 +4635,7 @@ func main() {
 	stop := make(chan struct{})
 	go backgroundTrainer(db, model, tok, qbuf, swarm, stop)
 
-	fmt.Println("molecule is alive. Type and press Enter. Ctrl+C to exit.")
+	fmt.Println("molequla is alive. Type and press Enter. Ctrl+C to exit.")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for {

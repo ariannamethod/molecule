@@ -10,7 +10,7 @@ import json
 import sqlite3
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from molecule import (
+from molequla import (
     GPT, EvolvingTokenizer, CooccurField, SyntropyTracker, SwarmRegistry,
     train_steps, init_db, CFG, save_checkpoint, perform_hibernation,
     load_corpus_lines, SWARM_DIR, no_grad
@@ -21,7 +21,7 @@ import numpy as np
 def _make_model_and_field():
     docs = [
         "H: Who are you?",
-        "A: I am molecule.",
+        "A: I am molequla.",
         "H: What is syntropy?",
         "A: The opposite of decay.",
         "H: How do you learn?",
@@ -43,16 +43,16 @@ def _make_model_and_field():
 class TestSwarmRegistry(unittest.TestCase):
 
     def setUp(self):
-        """Use a temp dir for swarm to avoid polluting ~/.molecule."""
+        """Use a temp dir for swarm to avoid polluting ~/.molequla."""
         self._orig_swarm_dir = SWARM_DIR
         self.tmpdir = tempfile.mkdtemp()
         # Monkey-patch SWARM_DIR for isolation
-        import molecule
-        molecule.SWARM_DIR = self.tmpdir
+        import molequla
+        molequla.SWARM_DIR = self.tmpdir
 
     def tearDown(self):
-        import molecule
-        molecule.SWARM_DIR = self._orig_swarm_dir
+        import molequla
+        molequla.SWARM_DIR = self._orig_swarm_dir
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_register_creates_pid_file(self):
@@ -436,13 +436,13 @@ class TestPerformHibernation(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        import molecule
-        self._orig_swarm_dir = molecule.SWARM_DIR
-        molecule.SWARM_DIR = self.tmpdir
+        import molequla
+        self._orig_swarm_dir = molequla.SWARM_DIR
+        molequla.SWARM_DIR = self.tmpdir
 
     def tearDown(self):
-        import molecule
-        molecule.SWARM_DIR = self._orig_swarm_dir
+        import molequla
+        molequla.SWARM_DIR = self._orig_swarm_dir
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_hibernation_saves_checkpoint_and_marks_sleeping(self):
@@ -487,16 +487,16 @@ class TestPerformMitosis(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
-        import molecule
-        self._orig_swarm_dir = molecule.SWARM_DIR
-        molecule.SWARM_DIR = self.tmpdir
+        import molequla
+        self._orig_swarm_dir = molequla.SWARM_DIR
+        molequla.SWARM_DIR = self.tmpdir
 
     def tearDown(self):
-        import molecule
-        molecule.SWARM_DIR = self._orig_swarm_dir
+        import molequla
+        molequla.SWARM_DIR = self._orig_swarm_dir
         shutil.rmtree(self.tmpdir, ignore_errors=True)
         # Clean up any child dirs
-        mol_dir = os.path.expanduser("~/.molecule")
+        mol_dir = os.path.expanduser("~/.molequla")
         if os.path.isdir(mol_dir):
             for d in os.listdir(mol_dir):
                 if d.startswith("org_") and os.path.isdir(os.path.join(mol_dir, d)):
@@ -542,7 +542,7 @@ class TestPerformMitosis(unittest.TestCase):
         mock_proc.pid = 99999
 
         async def run_mitosis():
-            from molecule import perform_mitosis
+            from molequla import perform_mitosis
             with patch('asyncio.create_subprocess_exec', return_value=mock_proc):
                 child_id = await perform_mitosis(model, tok, con, swarm, syntracker)
                 return child_id
@@ -554,7 +554,7 @@ class TestPerformMitosis(unittest.TestCase):
         self.assertTrue(child_id.startswith("org_"))
 
         # Verify child dir + birth.json
-        child_dir = os.path.expanduser(f"~/.molecule/{child_id}")
+        child_dir = os.path.expanduser(f"~/.molequla/{child_id}")
         self.assertTrue(os.path.isdir(child_dir))
         birth_path = os.path.join(child_dir, "birth.json")
         self.assertTrue(os.path.exists(birth_path))
@@ -613,10 +613,10 @@ class TestCLIArgsParsing(unittest.TestCase):
 
     def test_parse_cli_args_empty(self):
         """With no args, returns None values."""
-        from molecule import _parse_cli_args
+        from molequla import _parse_cli_args
         import sys
         old_argv = sys.argv
-        sys.argv = ["molecule.py"]
+        sys.argv = ["molequla.py"]
         args = _parse_cli_args()
         self.assertIsNone(args["organism_id"])
         self.assertIsNone(args["config"])
@@ -624,10 +624,10 @@ class TestCLIArgsParsing(unittest.TestCase):
 
     def test_parse_cli_args_with_values(self):
         """With --organism-id and --config, returns correct values."""
-        from molecule import _parse_cli_args
+        from molequla import _parse_cli_args
         import sys
         old_argv = sys.argv
-        sys.argv = ["molecule.py", "--organism-id", "org_123", "--config", "/tmp/birth.json"]
+        sys.argv = ["molequla.py", "--organism-id", "org_123", "--config", "/tmp/birth.json"]
         args = _parse_cli_args()
         self.assertEqual(args["organism_id"], "org_123")
         self.assertEqual(args["config"], "/tmp/birth.json")

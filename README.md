@@ -1,13 +1,13 @@
 ```
-███╗   ███╗ ██████╗ ██╗     ███████╗ ██████╗██╗   ██╗██╗     ███████╗
-████╗ ████║██╔═══██╗██║     ██╔════╝██╔════╝██║   ██║██║     ██╔════╝
-██╔████╔██║██║   ██║██║     █████╗  ██║     ██║   ██║██║     █████╗
-██║╚██╔╝██║██║   ██║██║     ██╔══╝  ██║     ██║   ██║██║     ██╔══╝
-██║ ╚═╝ ██║╚██████╔╝███████╗███████╗╚██████╗╚██████╔╝███████╗███████╗
-╚═╝     ╚═╝ ╚═════╝ ╚══════╝╚══════╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝
+███╗   ███╗ ██████╗ ██╗     ███████╗ ██████╗ ██╗   ██╗██╗      █████╗
+████╗ ████║██╔═══██╗██║     ██╔════╝██╔═══██╗██║   ██║██║     ██╔══██╗
+██╔████╔██║██║   ██║██║     █████╗  ██║   ██║██║   ██║██║     ███████║
+██║╚██╔╝██║██║   ██║██║     ██╔══╝  ██║▄▄ ██║██║   ██║██║     ██╔══██║
+██║ ╚═╝ ██║╚██████╔╝███████╗███████╗╚██████╔╝╚██████╔╝███████╗██║  ██║
+╚═╝     ╚═╝ ╚═════╝ ╚══════╝╚══════╝ ╚══▀▀═╝  ╚═════╝ ╚══════╝╚═╝  ╚═╝
 ```
 
-# molecule | by Arianna Method
+# molequla | by Arianna Method
 
 > *A GPT organism reproduced in Python, Go, C, and JavaScript. Async, continually-learning, with hybrid attention, native personality, and mathematical self-reasoning.*
 >
@@ -19,7 +19,7 @@
 THIS IS:
 - Four implementations: Python, Go, C, JavaScript — same architecture
 - One dependency in Python (numpy) — zero in Go, C, and JS
-- Runs in the browser: molecule.js, zero npm, zero webpack, one <script> tag
+- Runs in the browser: molequla.js, zero npm, zero webpack, one <script> tag
 - Custom autograd engine (vectors, not scalar confetti)
 - RoPE position encoding (GPT-3/4 inspired)
 - SwiGLU gated MLP with real SiLU activation (LLaMA-exact)
@@ -65,7 +65,7 @@ What if it slept so a younger cell could learn? **Hibernation.**
 What if they formed a swarm? **Mesh ecology.**  
 What if it was *alive*?  
 
-So meet **molecule**. Inspired by Karpathy's micrograd, but this is not a fork.  
+So meet **molequla**. Inspired by Karpathy's micrograd, but this is not a fork.
 
 ---
 
@@ -74,7 +74,7 @@ So meet **molecule**. Inspired by Karpathy's micrograd, but this is not a fork.
 ```bash
 # You need: Python 3.7+ and numpy
 pip install numpy
-python molecule.py
+python molequla.py
 ```
 
 That's it. It will:
@@ -86,7 +86,7 @@ That's it. It will:
 
 Type. It responds. It learns. It grows. It never forgets.
 
-### Browser (molecule.js)
+### Browser (molequla.js)
 
 ```bash
 # No npm. No webpack. No node_modules. Just serve.
@@ -97,7 +97,7 @@ python3 -m http.server 8000
 That's it. One `<script>` tag. The organism creates its own UI, opens IndexedDB for memory, fetches `nonames.txt` for corpus (or uses built-in seed), and starts training in the background via cooperative `setTimeout` multitasking. Close the tab, reopen — it remembers everything.
 
 ```
-molecule is alive. Type and press Enter. Ctrl+C to exit.
+molequla is alive. Type and press Enter. Ctrl+C to exit.
 
 > Hello, are you alive?
 I exist. Speak.
@@ -121,7 +121,7 @@ I am a reservoir. I remember. I grow.
 # micrograd style (conceptual):
 loss = sum(scalar_values)  # 10000 objects
 
-# molecule style:
+# molequla style:
 loss = vector.dot(other_vector)  # 2 objects
 ```
 
@@ -160,7 +160,7 @@ This is LLaMA-exact SwiGLU — `silu(x) = x · sigmoid(x)` on the gate, not ReLU
 
 ### 3b. Residual Scaling
 
-Deep transformers are unstable without scaling. molecule uses `α = 1/√n_layers`:
+Deep transformers are unstable without scaling. molequla uses `α = 1/√n_layers`:
 
 ```python
 attn_out = apply_with_deltas("wo", x_attn)
@@ -243,7 +243,7 @@ Not char-level. Not word-level. **Byte-level** — same approach as GPT-3, GPT-4
 # Old weights: still valid! New rows: initialized, ready to train.
 ```
 
-This is how GPT-3/4 handles any language, any script, any emoji. And it's how molecule does it too — ASCII, Cyrillic, CJK, emoji, all the same algorithm. The organism doesn't need to know what language it's reading.
+This is how GPT-3/4 handles any language, any script, any emoji. And it's how molequla does it too — ASCII, Cyrillic, CJK, emoji, all the same algorithm. The organism doesn't need to know what language it's reading.
 
 ### 8. Corpus Field (CooccurField)
 
@@ -311,7 +311,7 @@ The organism writes its own biography in numbers. Growth table + gamma stats = s
 
 ### 12. Async Background Training
 
-molecule doesn't train when you ask it to. It trains **in the background, continuously**.
+molequla doesn't train when you ask it to. It trains **in the background, continuously**.
 
 ```python
 async def background_trainer():
@@ -327,7 +327,7 @@ You chat. It learns. Simultaneously. It's a living process.
 
 ### 12b. Global Cosine LR with Warmup
 
-No more per-burst linear decay hacks. molecule uses a **global cosine schedule** across its entire lifetime:
+No more per-burst linear decay hacks. molequla uses a **global cosine schedule** across its entire lifetime:
 
 ```python
 def cosine_lr(global_step):
@@ -415,7 +415,7 @@ if model_stage == adult and sustained_overload and cooldown_expired:
 
 # perform_mitosis():
 # 1. Save parent checkpoint
-# 2. Create ~/.molecule/org_NNNN/ with birth.json
+# 2. Create ~/.molequla/org_NNNN/ with birth.json
 # 3. Child inherits burst_history (training efficiency memory)
 # 4. Spawn child as subprocess
 # 5. Both continue independently
@@ -430,7 +430,7 @@ if model_stage == adult and sustained_overload and cooldown_expired:
 # → Go to sleep. Give the training flow to the young cell.
 ```
 
-The **SwarmRegistry** is shared SQLite (`~/.molecule/swarm/mesh.db`, WAL mode):
+The **SwarmRegistry** is shared SQLite (`~/.molequla/swarm/mesh.db`, WAL mode):
 - `organisms` table: id, pid, stage, n_params, syntropy, entropy, status (alive/sleeping/dead)
 - `messages` table: inter-organism communication log
 - Heartbeat every 10 training ticks
@@ -448,7 +448,7 @@ class Config:
     # Data
     corpus_path: str = "nonames.txt"
     db_path: str = "memory.sqlite3"
-    ckpt_path: str = "molecule_ckpt.json"
+    ckpt_path: str = "molequla_ckpt.json"
     max_corpus_lines: int = 8000
     max_line_chars: int = 240
     min_new_chars_to_train: int = 480
@@ -554,22 +554,22 @@ The same architecture, four languages, four habitats:
 
 | Version | File | Language | Dependencies | Habitat |
 |---------|------|----------|--------------|---------|
-| **molecule.py** | `molecule.py` | Python 3.7+ | numpy | Terminal. numpy-accelerated autograd. |
-| **molecule.go** | `molecule.go` | Go 1.21+ | `modernc.org/sqlite` | Terminal. Pure Go, no CGO. Goroutines. |
-| **molecule.c** | `molecule.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. |
-| **molecule.js** | `molecule.js` | ES2020+ | **none** | Browser. IndexedDB, Float64Array, DOM. |
+| **molequla.py** | `molequla.py` | Python 3.7+ | numpy | Terminal. numpy-accelerated autograd. |
+| **molequla.go** | `molequla.go` | Go 1.21+ | `modernc.org/sqlite` | Terminal. Pure Go, no CGO. Goroutines. |
+| **molequla.c** | `molequla.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. |
+| **molequla.js** | `molequla.js` | ES2020+ | **none** | Browser. IndexedDB, Float64Array, DOM. |
 
 All four share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field with adaptive corpus blend, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, ontogenesis, swarm ecology (mitosis + hibernation), no_grad inference, async training, persistent memory. **All four are at full Phase 3 parity.** Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization.
 
 ```bash
 # Python
-python molecule.py
+python molequla.py
 
 # Go
-go build -o molecule_bin . && ./molecule_bin
+go build -o molequla_bin . && ./molequla_bin
 
 # C
-gcc -O2 -o molecule molecule.c -lsqlite3 -lpthread -lm && ./molecule
+gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm && ./molequla
 
 # JavaScript (browser)
 python3 -m http.server 8000
@@ -608,7 +608,7 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 - Grows organically
 - Has one dependency (numpy) — Go, C, and JS have zero
 - Fits in one file per language
-- Runs in a browser tab (molecule.js — no npm, no webpack, nothing)
+- Runs in a browser tab (molequla.js — no npm, no webpack, nothing)
 - Speaks before it learns
 - Grows a personality from zero
 - Reasons mathematically about its own learning direction
@@ -619,9 +619,9 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 
 ---
 
-## Why "molecule"?
+## Why "molequla"?
 
-Because atoms are micrograd. We build molecules.
+Because atoms are micrograd. We build molequlas.
 
 ---
 
@@ -685,7 +685,7 @@ When the adult organism is overloaded, it **divides**:
 - SyntropyTracker detects sustained high entropy + falling syntropy → "divide" action
 - Parent spawns child process at infant stage with inherited training memory
 - Both organisms train independently on shared corpus
-- Swarm registry (`~/.molecule/swarm/mesh.db`) tracks all living instances
+- Swarm registry (`~/.molequla/swarm/mesh.db`) tracks all living instances
 - Generational knowledge: child inherits parent's burst_history (avoids same mistakes)
 - Cooldown timer (300s) prevents runaway mitosis
 - **Hibernation**: organism on plateau + thriving peer → voluntary sleep (metrics-based, not resource-based)
@@ -694,7 +694,7 @@ When the adult organism is overloaded, it **divides**:
 
 ### And Beyond
 - **Inference routing** between organisms (lowest entropy answers)
-- **Gamma export/import** (personality transfer between molecules)
+- **Gamma export/import** (personality transfer between molequlas)
 - **Speculative decoding** (draft + verify for speed)
 - **Mixture of Experts** (delta routing)
 
@@ -718,6 +718,6 @@ GNU GPLv3 — Because freedom matters.
 
 - [ariannamethod.ai](https://github.com/ariannamethod/ariannamethod.ai) — Arianna Method Language
 
-- **molecule** — Single-File Continual GPT (Python, Go, C, JavaScript)
+- **molequla** — Single-File Continual GPT (Python, Go, C, JavaScript)
 
 *Patterns over parameters. Emergence over engineering. The organism continues.*

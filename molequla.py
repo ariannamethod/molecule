@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-molecule.py
+molequla.py
 A single-file, async, continually-learning GPT organism. One dependency: numpy.
 
 - Trains on nonames.txt (one sentence per line)
@@ -41,7 +41,7 @@ class Config:
     # data
     corpus_path: str = "nonames.txt"
     db_path: str = "memory.sqlite3"
-    ckpt_path: str = "molecule_ckpt.json"
+    ckpt_path: str = "molequla_ckpt.json"
     max_corpus_lines: int = 8000
     max_line_chars: int = 240
 
@@ -2427,10 +2427,10 @@ class QuantumBuffer:
 # And lo, the first cell shall call into the void and hear only silence.
 # But the second shall call and hear an answer.
 
-SWARM_DIR = os.path.expanduser("~/.molecule/swarm")
+SWARM_DIR = os.path.expanduser("~/.molequla/swarm")
 
 class SwarmRegistry:
-    """Discover and track other molecule instances via shared SQLite."""
+    """Discover and track other molequla instances via shared SQLite."""
 
     def __init__(self, organism_id=None):
         self.organism_id = organism_id or f"org_{os.getpid()}_{int(time.time())}"
@@ -2523,7 +2523,7 @@ import sys as _sys
 async def perform_mitosis(model, tok, con, swarm, syntracker):
     """The organism divides. Parent continues. Child starts at infant stage."""
     child_id = f"org_{int(time.time())}_{random.randint(1000,9999)}"
-    child_dir = os.path.expanduser(f"~/.molecule/{child_id}")
+    child_dir = os.path.expanduser(f"~/.molequla/{child_id}")
     os.makedirs(child_dir, exist_ok=True)
 
     # Save parent checkpoint for child's reference
@@ -2536,7 +2536,7 @@ async def perform_mitosis(model, tok, con, swarm, syntracker):
         "parent_id": swarm.organism_id,
         "corpus_path": CFG.corpus_path,
         "db_path": os.path.join(child_dir, "memory.sqlite3"),
-        "ckpt_path": os.path.join(child_dir, "molecule_ckpt.json"),
+        "ckpt_path": os.path.join(child_dir, "molequla_ckpt.json"),
         "burst_history": syntracker.burst_history,
     }
     birth_path = os.path.join(child_dir, "birth.json")
@@ -2783,7 +2783,7 @@ async def chat_main():
 
     if not os.path.exists(CFG.corpus_path):
         print(f"Seed corpus not found: {CFG.corpus_path}")
-        print("Place nonames.txt alongside molecule.py to begin.")
+        print("Place nonames.txt alongside molequla.py to begin.")
         return
 
     docs = load_corpus_lines(CFG.corpus_path)
@@ -2822,7 +2822,7 @@ async def chat_main():
     if syntracker_seed:
         model._inherited_burst_history = syntracker_seed
 
-    print("molecule is alive. Type and press Enter. Ctrl+C to exit.\n")
+    print("molequla is alive. Type and press Enter. Ctrl+C to exit.\n")
     try:
         while True:
             user_text = await asyncio.get_event_loop().run_in_executor(None, input, "> ")

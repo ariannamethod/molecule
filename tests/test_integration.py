@@ -11,7 +11,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from molecule import GPT, EvolvingTokenizer, train_steps, backward, CFG
+from molequla import GPT, EvolvingTokenizer, train_steps, backward, CFG
 
 
 class TestTrainingIntegration(unittest.TestCase):

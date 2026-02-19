@@ -6,7 +6,7 @@ import unittest
 import copy
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from molecule import (
+from molequla import (
     GPT, EvolvingTokenizer, backward, no_grad, train_steps, CFG
 )
 

@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from molecule import (
+from molequla import (
     MatrixParam, VectorValue, GPT, EvolvingTokenizer,
     DeltaAdapter, CFG, backward, rmsnorm, rope_rotate
 )

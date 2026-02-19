@@ -8,7 +8,7 @@ import (
 )
 
 // SoftmaxProbs computes softmax probabilities from logits.
-// (Copied from molecule.go for testing since Go cannot import main packages)
+// (Copied from molequla.go for testing since Go cannot import main packages)
 func SoftmaxProbs(data []float64) []float64 {
 	maxVal := data[0]
 	for _, v := range data[1:] {
@@ -31,7 +31,7 @@ func SoftmaxProbs(data []float64) []float64 {
 }
 
 // TopKTopPSample samples from probs with top-k, top-p, min-p, and typical-p filtering.
-// (Copied from molecule.go for testing since Go cannot import main packages)
+// (Copied from molequla.go for testing since Go cannot import main packages)
 func TopKTopPSample(probs []float64, k int, p float64, minP float64, typicalP float64) int {
 	n := len(probs)
 	idx := make([]int, n)

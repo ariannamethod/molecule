@@ -5,7 +5,7 @@ import os
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from molecule import CooccurField, EvolvingTokenizer, corpus_generate
+from molequla import CooccurField, EvolvingTokenizer, corpus_generate
 
 
 def _make_field():

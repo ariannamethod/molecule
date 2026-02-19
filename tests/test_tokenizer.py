@@ -10,7 +10,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from molecule import EvolvingTokenizer, CFG, _unicode_segment
+from molequla import EvolvingTokenizer, CFG, _unicode_segment
 
 
 class TestEvolvingTokenizerByteLevel(unittest.TestCase):
