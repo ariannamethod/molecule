@@ -432,36 +432,6 @@ This is not load balancing. It's **ecological optimization** — organisms that 
 
 ---
 
-## The Stack
-
-| Component | microgpt | molecule |
-|-----------|----------|----------|
-| Autograd | Scalar (micrograd) | **Vector** (custom) |
-| Position encoding | Sinusoidal | **RoPE** |
-| Attention | Standard | **Hybrid** (Content + RRPRAM + blend) |
-| MLP | ReLU | **SwiGLU (real SiLU)** |
-| Tokenizer | Fixed char | **Evolving BPE** |
-| Training | One-shot | **Continuous async** |
-| Training trigger | — | **QuantumBuffer** (bytes + novelty + cooldown) |
-| Temperature | Fixed | **Entropy-adaptive** |
-| Pre-training speech | — | **CooccurField** (trigram corpus stats) |
-| Memory | None | **SQLite persistent** |
-| Adapters | None | **LoRA-style deltas** |
-| Personality | None | **Native gamma** (sparse embedding drift) |
-| Growth tracking | None | **SQLite growth table** |
-| Noise rejection | None | **Native immune system** (γ drift + delta rollback) |
-| Self-reasoning | None | **SyntropyTracker** (entropy trend + field deviation + purpose alignment) |
-| Ecology | None | **Swarm** (mitosis + hibernation + mesh.db) |
-| Residual scaling | No | **α = 1/√n_layers** |
-| LR schedule | Fixed | **Global cosine + linear warmup** |
-| Grad accumulation | No | **Configurable (scales with growth)** |
-| Sampling | top-k | **min_p + typical_p + nucleus** |
-| Weight tying | No | **Yes (GPT-style)** |
-| Dependencies | torch | **numpy** (Python) / **none** (Go, C, JS) |
-| Browser | No | **molecule.js** (IndexedDB, zero deps, cooperative training) |
-
----
-
 ## Configuration
 
 ```python
