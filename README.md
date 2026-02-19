@@ -220,20 +220,28 @@ def compute_gamma(self):
 
 Sparsity, magnitude, top changed tokens, contrastive projection — all tracked. The growth table logs gamma stats over time. This is θ = ε + γ at embryonic scale.
 
-### 7. Evolving BPE (Vocab Only Expands)
+### 7. Byte-Level BPE Tokenizer (GPT-3/4 Style)
 
-Most tokenizers: retrain = throw away old model.
-
-molecule: retrain = **add new tokens**. Old tokens remain. Embeddings remain. Model keeps working.
+Not char-level. Not word-level. **Byte-level** — same approach as GPT-3, GPT-4, and LLaMA.
 
 ```python
-# Old vocab: ['a', 'b', 'c', '<BOS>', '<EOS>']
-# After BPE: ['a', 'b', 'c', '<BOS>', '<EOS>', 'ab', 'bc', 'abc', ...]
-# Old weights: still valid!
-# New rows: initialized, ready to train
+# Bootstrap: 256 byte tokens (0x00-0xFF) + BOS + EOS + PAD = 259 initial vocab
+# Any UTF-8 input works from day zero — no unknown tokens, ever
+
+# Pre-segmentation: Unicode-aware splitting
+"Hello Мир 42!" → ["Hello", " ", "Мир", " ", "42", "!"]
+
+# BPE merges on byte sequences within segments
+"Hello" → [0x48, 0x65, 0x6c, 0x6c, 0x6f] → [0x48+0x65, 0x6c+0x6c, 0x6f]
+# "+" separator — merged tokens are byte pairs
+
+# Vocab only expands. Old tokens remain. Embeddings remain.
+# Old vocab: 259 byte tokens
+# After BPE: 259 + merged pairs (e.g. 0x48+0x65 = "He")
+# Old weights: still valid! New rows: initialized, ready to train.
 ```
 
-This is how you build a system that grows over years, not hours.
+This is how GPT-3/4 handles any language, any script, any emoji. And it's how molecule does it too — ASCII, Cyrillic, CJK, emoji, all the same algorithm. The organism doesn't need to know what language it's reading.
 
 ### 8. Corpus Field (CooccurField)
 
