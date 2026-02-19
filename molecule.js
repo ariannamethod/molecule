@@ -39,10 +39,20 @@ const CFG = {
 
     // model
     tieEmbeddings: true,
-    nLayer: 2,
-    nEmbd: 72,
-    nHead: 4,
+    nLayer: 1,
+    nEmbd: 16,
+    nHead: 1,
     blockSize: 96,
+
+    // ontogenesis — growth stages [corpus_chars, n_embd, n_layer, n_head]
+    growthStages: [
+        [0,      16, 1, 1],    // embryo: ~25K params
+        [20000,  32, 1, 2],    // infant: ~100K params
+        [50000,  64, 2, 4],    // child: ~500K params
+        [200000, 128, 4, 4],   // adolescent: ~2M params
+        [500000, 256, 6, 8],   // adult: ~10M params
+    ],
+    freezeAfterGrowthSteps: 200,
 
     // training
     warmupSteps: 1200,
@@ -79,7 +89,7 @@ const CFG = {
     trainTickMs: 250,
 
     // hybrid attention
-    headTypes: ["content", "content", "hybrid", "hybrid"],
+    headTypes: ["content"],
     hybridAlphaInit: 0.5,
 
     // gamma (personality fingerprint)
@@ -119,6 +129,17 @@ const CFG = {
     qbMinBytes: 480,
     qbMinNovelty: 0.15,
 };
+
+function headTypesForNHead(n) {
+    // Compute head type array for a given number of heads.
+    if (n <= 1) return ["content"];
+    if (n === 2) return ["content", "hybrid"];
+    const half = Math.floor(n / 2);
+    const result = [];
+    for (let i = 0; i < half; i++) result.push("content");
+    for (let i = 0; i < n - half; i++) result.push("hybrid");
+    return result;
+}
 
 // ============================================================
 // 0.5) SEEDED PRNG — because Math.random() has no soul
@@ -1180,6 +1201,33 @@ class MatrixParam {
         this.nout = newNout;
     }
 
+    growCols(newNin, std) {
+        // And lo, the matrix shall widen its reach, each row stretching into new dimensions.
+        // Float64Array is NOT resizable — must create new array + copy.
+        if (std === undefined) std = 0.02;
+        if (newNin <= this.nin) return;
+        for (let i = 0; i < this.rows.length; i++) {
+            const row = this.rows[i];
+            const newData = new Float64Array(newNin);
+            newData.set(row.data);
+            for (let j = this.nin; j < newNin; j++) newData[j] = gaussRandom(0, std);
+            row.data = newData;
+            if (row.grad) {
+                const newGrad = new Float64Array(newNin);
+                newGrad.set(row.grad);
+                row.grad = newGrad;
+            }
+        }
+        this.nin = newNin;
+    }
+
+    grow(newNout, newNin, std) {
+        // Ontogenesis: grow both dimensions. Cols first so new rows get full width.
+        if (std === undefined) std = 0.02;
+        this.growCols(newNin, std);
+        this.growRows(newNout, std);
+    }
+
     params() { return this.rows.slice(); }
 }
 
@@ -1406,6 +1454,12 @@ class DeltaAdapter {
         this.A.growRows(newNout, 0.02);
     }
 
+    growDims(newNout, newNin) {
+        // Ontogenesis: grow both outer dimensions of the adapter. Rank stays the same.
+        this.A.growRows(newNout);    // A: (nout, r) -> extend output
+        this.B.growCols(newNin);     // B: (r, nin) -> extend input
+    }
+
     params() {
         return this.A.params().concat(this.B.params());
     }
@@ -1505,6 +1559,9 @@ class GPT {
         // syntropy temperature offset (adjusted by syntropy tracker decisions)
         this.syntropyTempOffset = 0;
 
+        // ontogenesis: freeze base after growth
+        this._growthFreezeRemaining = 0;
+
         // ensure at least one delta
         this.addDeltaModule(1.0);
     }
@@ -1557,6 +1614,181 @@ class GPT {
             for (const key in mod) out.push(...mod[key].params());
         }
         return out;
+    }
+
+    // ---- Ontogenesis (architecture growth) ----
+    // And lo, the organism shall not be born adult but shall grow, stage by stage,
+    // from embryo to child to adolescent, each growth a small death and rebirth.
+
+    currentGrowthStage() {
+        for (let i = 0; i < CFG.growthStages.length; i++) {
+            const [, embd, layer, head] = CFG.growthStages[i];
+            if (this.nEmbd === embd && this.nLayer === layer && this.nHead === head) return i;
+        }
+        return -1; // dimensions don't match any stage (legacy checkpoint)
+    }
+
+    targetGrowthStage(corpusChars) {
+        let target = 0;
+        for (let i = 0; i < CFG.growthStages.length; i++) {
+            if (corpusChars >= CFG.growthStages[i][0]) target = i;
+        }
+        return target;
+    }
+
+    maybeGrowArchitecture(corpusChars) {
+        const current = this.currentGrowthStage();
+        if (current < 0) return false; // legacy checkpoint, skip growth
+        const target = this.targetGrowthStage(corpusChars);
+        if (target <= current) return false;
+
+        const [, newEmbd, newLayer, newHead] = CFG.growthStages[target];
+        const oldEmbd = this.nEmbd;
+        const oldLayer = this.nLayer;
+        const oldHead = this.nHead;
+        const newHeadDim = Math.floor(newEmbd / newHead);
+
+        logUI(`[growth] ONTOGENESIS: stage ${current} -> ${target}`);
+        logUI(`  embd: ${oldEmbd} -> ${newEmbd}, layer: ${oldLayer} -> ${newLayer}, head: ${oldHead} -> ${newHead}`);
+
+        // 1. Grow embedding matrices (columns only — vocab rows stay)
+        this.base["wte"].growCols(newEmbd);
+        this.base["wpe"].growCols(newEmbd);
+        if (!CFG.tieEmbeddings) {
+            this.base["lm_head"].growCols(newEmbd);
+        }
+
+        // 2. Grow existing layer matrices
+        const newHtypes = headTypesForNHead(newHead);
+        for (let li = 0; li < oldLayer; li++) {
+            for (const name of ["wq", "wk", "wv", "wo"]) {
+                this.base[`l${li}.${name}`].grow(newEmbd, newEmbd);
+            }
+            this.base[`l${li}.fc_g`].grow(4 * newEmbd, newEmbd);
+            this.base[`l${li}.fc_v`].grow(4 * newEmbd, newEmbd);
+            this.base[`l${li}.fc2`].grow(newEmbd, 4 * newEmbd);
+            // Grow existing head pattern matrices
+            for (let h = 0; h < oldHead; h++) {
+                const pkey = `l${li}.h${h}.w_pattern`;
+                if (this.base[pkey]) this.base[pkey].growCols(newHeadDim);
+            }
+            // Add new heads for existing layer
+            for (let h = oldHead; h < newHead; h++) {
+                const htype = h < newHtypes.length ? newHtypes[h] : "content";
+                if (htype === "rrpram" || htype === "hybrid") {
+                    this.base[`l${li}.h${h}.w_pattern`] = new MatrixParam(
+                        CFG.blockSize, newHeadDim, 0.08);
+                }
+                if (htype === "hybrid") {
+                    this.base[`l${li}.h${h}.alpha`] = new MatrixParam(1, 1, 0.0);
+                    this.base[`l${li}.h${h}.alpha`].rows[0].data[0] = CFG.hybridAlphaInit;
+                }
+            }
+        }
+
+        // 3. Add entirely new layers
+        for (let li = oldLayer; li < newLayer; li++) {
+            this.base[`l${li}.wq`] = new MatrixParam(newEmbd, newEmbd, 0.08);
+            this.base[`l${li}.wk`] = new MatrixParam(newEmbd, newEmbd, 0.08);
+            this.base[`l${li}.wv`] = new MatrixParam(newEmbd, newEmbd, 0.08);
+            this.base[`l${li}.wo`] = new MatrixParam(newEmbd, newEmbd, 0.08);
+            this.base[`l${li}.fc_g`] = new MatrixParam(4 * newEmbd, newEmbd, 0.08);
+            this.base[`l${li}.fc_v`] = new MatrixParam(4 * newEmbd, newEmbd, 0.08);
+            this.base[`l${li}.fc2`] = new MatrixParam(newEmbd, 4 * newEmbd, 0.08);
+            for (let h = 0; h < newHead; h++) {
+                const htype = h < newHtypes.length ? newHtypes[h] : "content";
+                if (htype === "rrpram" || htype === "hybrid") {
+                    this.base[`l${li}.h${h}.w_pattern`] = new MatrixParam(
+                        CFG.blockSize, newHeadDim, 0.08);
+                }
+                if (htype === "hybrid") {
+                    this.base[`l${li}.h${h}.alpha`] = new MatrixParam(1, 1, 0.0);
+                    this.base[`l${li}.h${h}.alpha`].rows[0].data[0] = CFG.hybridAlphaInit;
+                }
+            }
+        }
+
+        // 4. Grow delta adapters
+        const r = CFG.deltaRank;
+        for (const mod of this.deltas) {
+            // Grow existing layer adapters
+            for (let li = 0; li < oldLayer; li++) {
+                for (const name of ["wq", "wk", "wv", "wo"]) {
+                    const key = `l${li}.${name}`;
+                    if (mod[key]) mod[key].growDims(newEmbd, newEmbd);
+                }
+                for (const [key, noutM, ninM] of [
+                    [`l${li}.fc_g`, 4, 1],
+                    [`l${li}.fc_v`, 4, 1],
+                    [`l${li}.fc2`, 1, 4],
+                ]) {
+                    if (mod[key]) mod[key].growDims(noutM * newEmbd, ninM * newEmbd);
+                }
+                for (let h = 0; h < oldHead; h++) {
+                    const pkey = `l${li}.h${h}.w_pattern`;
+                    if (mod[pkey]) mod[pkey].growDims(CFG.blockSize, newHeadDim);
+                }
+                for (let h = oldHead; h < newHead; h++) {
+                    const htype = h < newHtypes.length ? newHtypes[h] : "content";
+                    if (htype === "rrpram" || htype === "hybrid") {
+                        mod[`l${li}.h${h}.w_pattern`] = new DeltaAdapter(
+                            CFG.blockSize, newHeadDim, r);
+                    }
+                }
+            }
+            // New layers: entirely new adapters
+            for (let li = oldLayer; li < newLayer; li++) {
+                for (const name of ["wq", "wk", "wv", "wo"]) {
+                    mod[`l${li}.${name}`] = new DeltaAdapter(newEmbd, newEmbd, r);
+                }
+                mod[`l${li}.fc_g`] = new DeltaAdapter(4 * newEmbd, newEmbd, r);
+                mod[`l${li}.fc_v`] = new DeltaAdapter(4 * newEmbd, newEmbd, r);
+                mod[`l${li}.fc2`] = new DeltaAdapter(newEmbd, 4 * newEmbd, r);
+                for (let h = 0; h < newHead; h++) {
+                    const htype = h < newHtypes.length ? newHtypes[h] : "content";
+                    if (htype === "rrpram" || htype === "hybrid") {
+                        mod[`l${li}.h${h}.w_pattern`] = new DeltaAdapter(
+                            CFG.blockSize, newHeadDim, r);
+                    }
+                }
+            }
+            // lm_head adapter input grew
+            if (mod["lm_head"]) {
+                mod["lm_head"].growDims(this.tok.vocabSize, newEmbd);
+            }
+        }
+
+        // 5. Update model state
+        this.nEmbd = newEmbd;
+        this.nLayer = newLayer;
+        this.nHead = newHead;
+        this.headDim = newHeadDim;
+        this.residualAlpha = 1.0 / Math.sqrt(Math.max(1, newLayer));
+
+        // 6. Update CFG runtime
+        CFG.nEmbd = newEmbd;
+        CFG.nLayer = newLayer;
+        CFG.nHead = newHead;
+        CFG.headTypes = headTypesForNHead(newHead);
+
+        // 7. Reset Adam state (old momentum is meaningless after arch change)
+        this._adam = {};
+
+        // 8. Extend gamma snapshot for new embedding dimensions
+        for (let i = 0; i < this._initEmbedSnapshot.length; i++) {
+            const old = this._initEmbedSnapshot[i];
+            if (old.length < newEmbd) {
+                const ext = new Float64Array(newEmbd);
+                ext.set(old);
+                this._initEmbedSnapshot[i] = ext;
+            }
+        }
+
+        // 9. Set freeze (only train deltas until new weights stabilize)
+        this._growthFreezeRemaining = CFG.freezeAfterGrowthSteps;
+
+        logUI(`[growth] Done. Freeze for ${CFG.freezeAfterGrowthSteps} steps.`);
+        return true;
     }
 
     // ---- Native gamma (personality fingerprint) ----
@@ -2108,6 +2340,13 @@ async function saveCheckpoint(model, tok) {
         globalStep: model.globalStep,
         initEmbedSnapshot: model._initEmbedSnapshot.map(a => Array.from(a)),
         deltas: [],
+        // ontogenesis state
+        modelDims: {
+            nEmbd: model.nEmbd,
+            nLayer: model.nLayer,
+            nHead: model.nHead,
+            growthFreezeRemaining: model._growthFreezeRemaining,
+        },
     };
     for (const key in model.base) {
         obj.base[key] = serializeMatrixParam(model.base[key]);
@@ -2148,10 +2387,29 @@ async function loadCheckpoint(docs) {
     tok.bpeEnabled = !!t.bpeEnabled;
     tok._trainedChars = t.trainedChars || 0;
 
+    // Restore model dimensions from checkpoint (ontogenesis state)
+    if (obj.modelDims) {
+        CFG.nEmbd = obj.modelDims.nEmbd || CFG.nEmbd;
+        CFG.nLayer = obj.modelDims.nLayer || CFG.nLayer;
+        CFG.nHead = obj.modelDims.nHead || CFG.nHead;
+        CFG.headTypes = headTypesForNHead(CFG.nHead);
+    } else if (obj.cfg) {
+        // Fallback: restore from saved CFG for pre-ontogenesis checkpoints
+        if (obj.cfg.nEmbd) CFG.nEmbd = obj.cfg.nEmbd;
+        if (obj.cfg.nLayer) CFG.nLayer = obj.cfg.nLayer;
+        if (obj.cfg.nHead) CFG.nHead = obj.cfg.nHead;
+        if (obj.cfg.headTypes) CFG.headTypes = obj.cfg.headTypes;
+    }
+
     const model = new GPT(tok);
 
     // Restore globalStep for cosine LR continuity
     model.globalStep = obj.globalStep || 0;
+
+    // Restore ontogenesis freeze
+    if (obj.modelDims && obj.modelDims.growthFreezeRemaining > 0) {
+        model._growthFreezeRemaining = obj.modelDims.growthFreezeRemaining;
+    }
 
     // Restore base
     model.base = {};
@@ -2221,8 +2479,17 @@ function cosineLR(globalStep) {
 
 function trainSteps(model, tok, docs, steps, trainBase, trainDeltas) {
     if (!docs.length) return;
-    const baseParams = trainBase ? model.allBaseParams() : [];
-    const deltaParams = trainDeltas ? model.allDeltaParams() : [];
+
+    // Ontogenesis freeze: after growth, only train deltas until new weights stabilize
+    let baseParams, deltaParams;
+    if (model._growthFreezeRemaining > 0) {
+        baseParams = [];
+        deltaParams = trainDeltas ? model.allDeltaParams() : [];
+        model._growthFreezeRemaining = Math.max(0, model._growthFreezeRemaining - steps);
+    } else {
+        baseParams = trainBase ? model.allBaseParams() : [];
+        deltaParams = trainDeltas ? model.allDeltaParams() : [];
+    }
 
     for (let step = 0; step < steps; step++) {
         // --- Gradient accumulation loop ---
@@ -2262,6 +2529,9 @@ class SyntropyTracker {
         this.purposeAlignment = 0.0;
         this.lastAction = "none";
         this.burstHistory = [];
+        this.modelStage = 0;          // current growth stage (set during measure)
+        this._lastMitosisTime = 0.0;  // cooldown for divide
+        this._swarmInfo = null;        // peer state from swarm (set externally)
     }
 
     recordBurst(action, lossBefore, lossAfter) {
@@ -2280,6 +2550,7 @@ class SyntropyTracker {
     }
 
     measure(model, tok, field, docs) {
+        this.modelStage = model.currentGrowthStage();
         const entropyNow = model.computeModelEntropy(tok, docs);
         this.entropyHistory.push(entropyNow);
         if (this.entropyHistory.length > CFG.syntropyWindow) {
@@ -2351,8 +2622,22 @@ class SyntropyTracker {
             tempOffset = 0.0;
         }
 
+        // CASE 6: Adult + sustained overload -> divide (mitosis)
+        const maxStage = CFG.growthStages.length - 1;
+        if (this.modelStage >= maxStage &&
+                this._isSustainedOverload() &&
+                (Date.now() / 1000) - this._lastMitosisTime > 300) {
+            action = "divide";
+            lrMultiplier = CFG.syntropyLrDampen; // slow down while preparing to split
+        }
+
+        // CASE 7: Plateau + young peer thriving -> hibernate (cooperative scheduling)
+        if (action === "steady" && this._shouldHibernate()) {
+            action = "hibernate";
+        }
+
         // SELF-META-LEARNING: downgrade actions that historically hurt loss
-        if (this.burstHistory.length >= 4) {
+        if (action !== "divide" && action !== "hibernate" && this.burstHistory.length >= 4) {
             const eff = this.actionEffectiveness(action);
             if (eff.count > 0 && eff.mean > 0.05) {
                 if (action === "amplify") {
@@ -2382,6 +2667,37 @@ class SyntropyTracker {
             purposeAlignment: this.purposeAlignment,
             actionTaken: action,
         });
+    }
+
+    _isSustainedOverload() {
+        // High entropy for >75% of window + falling syntropy = overloaded.
+        if (this.entropyHistory.length < CFG.syntropyWindow) return false;
+        const recent = this.entropyHistory.slice(-CFG.syntropyWindow);
+        let highCount = 0;
+        for (const e of recent) {
+            if (e > CFG.entropyHigh) highCount++;
+        }
+        return highCount > CFG.syntropyWindow * 0.75 && this.syntropyTrend < -0.02;
+    }
+
+    _shouldHibernate() {
+        // Should this organism sleep to give resources to peers?
+        // Conditions: loss on plateau + a peer is in amplify/boost state.
+        if (!this._swarmInfo || !this._swarmInfo.peers || this._swarmInfo.peers.length === 0) {
+            return false;
+        }
+        for (const peer of this._swarmInfo.peers) {
+            if ((peer.syntropy || 0) > 0.05) {
+                // A young peer is thriving. If we're stale, hibernate.
+                if (this.burstHistory.length >= 8) {
+                    const recentDeltas = this.burstHistory.slice(-8).map(
+                        b => b.lossAfter - b.lossBefore);
+                    const avgDelta = recentDeltas.reduce((a, v) => a + v, 0) / recentDeltas.length;
+                    if (Math.abs(avgDelta) < 0.01) return true; // loss plateau
+                }
+            }
+        }
+        return false;
     }
 }
 
@@ -2429,6 +2745,128 @@ class QuantumBuffer {
 }
 
 // ============================================================
+// 9.7) SWARM ECOLOGY — the organism learns it is not alone
+// ============================================================
+// And lo, the first cell shall call into the void and hear only silence.
+// But the second shall call and hear an answer.
+// In the browser, BroadcastChannel is our mesh — tabs are organisms.
+
+class SwarmRegistry {
+    constructor(organismId) {
+        this.organismId = organismId || `org_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        this.channel = null;
+        this.peers = new Map(); // id -> {stage, nParams, syntropy, entropy, lastSeen, status}
+        this._onMessage = null;
+    }
+
+    register() {
+        if (typeof BroadcastChannel === "undefined") return; // fallback: no swarm
+        this.channel = new BroadcastChannel("molecule_swarm");
+        this._onMessage = (event) => {
+            const msg = event.data;
+            if (!msg || !msg.id || msg.id === this.organismId) return;
+            if (msg.type === "heartbeat") {
+                this.peers.set(msg.id, {
+                    stage: msg.stage || 0,
+                    nParams: msg.nParams || 0,
+                    syntropy: msg.syntropy || 0,
+                    entropy: msg.entropy || 0,
+                    lastSeen: Date.now(),
+                    status: msg.status || "alive",
+                });
+            } else if (msg.type === "register") {
+                this.peers.set(msg.id, {
+                    stage: 0, nParams: 0, syntropy: 0, entropy: 0,
+                    lastSeen: Date.now(), status: "alive",
+                });
+            } else if (msg.type === "dead") {
+                this.peers.delete(msg.id);
+            } else if (msg.type === "sleeping") {
+                if (this.peers.has(msg.id)) {
+                    this.peers.get(msg.id).status = "sleeping";
+                }
+            }
+        };
+        this.channel.addEventListener("message", this._onMessage);
+        // Announce ourselves
+        this.channel.postMessage({ type: "register", id: this.organismId });
+    }
+
+    heartbeat(stage, nParams, syntropy, entropy) {
+        if (!this.channel) return;
+        this.channel.postMessage({
+            type: "heartbeat", id: this.organismId,
+            stage, nParams, syntropy, entropy, status: "alive",
+        });
+    }
+
+    discoverPeers(timeoutMs) {
+        if (!timeoutMs) timeoutMs = 60000;
+        const cutoff = Date.now() - timeoutMs;
+        const alive = [];
+        for (const [id, info] of this.peers) {
+            if (info.lastSeen > cutoff && info.status === "alive") {
+                alive.push({ id, ...info });
+            }
+        }
+        return alive;
+    }
+
+    markHibernating() {
+        if (!this.channel) return;
+        this.channel.postMessage({ type: "sleeping", id: this.organismId });
+    }
+
+    unregister() {
+        if (!this.channel) return;
+        this.channel.postMessage({ type: "dead", id: this.organismId });
+        if (this._onMessage) {
+            this.channel.removeEventListener("message", this._onMessage);
+        }
+        this.channel.close();
+        this.channel = null;
+    }
+}
+
+async function idbPut(storeName, key, value) {
+    // Helper: write to IndexedDB kv store with a namespaced key
+    await DB.saveKV(`${storeName}:${key}`, value);
+}
+
+async function idbGet(storeName, key) {
+    return await DB.loadKV(`${storeName}:${key}`);
+}
+
+async function performMitosis(model, tok, swarm, syntracker) {
+    // And lo, the organism divides. In the browser, mitosis = opening a new tab.
+    const childId = `org_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+    // Save birth config to IndexedDB
+    const birth = {
+        organism_id: childId,
+        parent_id: swarm.organismId,
+        burst_history: syntracker.burstHistory,
+    };
+    await idbPut("births", childId, birth);
+
+    // Open new tab — it will read birth config on startup
+    window.open(`${location.href.split("?")[0]}?organism=${childId}`, "_blank");
+
+    syntracker._lastMitosisTime = Date.now() / 1000;
+    logUI(`[ecology] Child ${childId} spawned (new tab)`);
+    return childId;
+}
+
+function performHibernation(model, tok, swarm) {
+    // And lo, the organism sleeps. In the browser: stop training, save state.
+    // The tab stays open but stops consuming CPU.
+    logUI(`[ecology] HIBERNATION — organism ${swarm.organismId} going to sleep`);
+    swarm.markHibernating();
+    _trainerRunning = false;
+    setStatus("hibernating");
+}
+
+// ============================================================
 // 10) BACKGROUND TRAINER — cooperative multitasking via setTimeout
 // ============================================================
 // And lo, asynchronous training shall occur, because sleeping is for humans.
@@ -2442,6 +2880,8 @@ let _warmedUp = false;
 let _lastEventId = 0;
 let _qbuf = null;
 let _syntracker = null;
+let _swarm = null;
+let _tickCount = 0;
 
 async function trainerTick() {
     if (!_trainerRunning || !_model || !_tok) return;
@@ -2578,8 +3018,40 @@ async function trainerTick() {
                     await saveCheckpoint(_model, _tok);
                 }
 
+                // Ontogenesis: check if architecture should grow
+                const corpusChars = docs.reduce((a, d) => a + d.length, 0);
+                if (_model.maybeGrowArchitecture(corpusChars)) {
+                    await saveCheckpoint(_model, _tok);
+                    await dbLogGrowth(_model, _tok, docs, 0,
+                        `ontogenesis:stage=${_model.currentGrowthStage()}`);
+                }
+
+                // Ecology: mitosis / hibernation
+                if (_swarm && action === "divide") {
+                    logUI("[ecology] MITOSIS triggered — organism overloaded, spawning child");
+                    await performMitosis(_model, _tok, _swarm, _syntracker);
+                }
+                if (_swarm && action === "hibernate") {
+                    performHibernation(_model, _tok, _swarm);
+                    await saveCheckpoint(_model, _tok);
+                    return; // exit training loop
+                }
+
                 setStatus("alive");
             }
+        }
+
+        // Swarm heartbeat (every 10 ticks)
+        _tickCount++;
+        if (_swarm && _tickCount % 10 === 0) {
+            const stage = _model.currentGrowthStage();
+            const nP = _model.allBaseParams().reduce((a, p) => a + p.data.length, 0)
+                     + _model.allDeltaParams().reduce((a, p) => a + p.data.length, 0);
+            _syntracker._swarmInfo = { peers: _swarm.discoverPeers() };
+            _swarm.heartbeat(stage, nP, _syntracker.syntropyTrend,
+                _syntracker.entropyHistory.length > 0
+                    ? _syntracker.entropyHistory[_syntracker.entropyHistory.length - 1]
+                    : 0.0);
         }
     } catch (e) {
         logUI(`[trainer] error: ${e.message}`);
@@ -2764,7 +3236,18 @@ async function awaken() {
     await DB.open();
     logUI("[db] IndexedDB memory opened.");
 
-    // Try to load corpus (fetch → DB → default)
+    // Check if this is a child organism (spawned via mitosis)
+    const urlParams = new URLSearchParams(location.search);
+    const childOrganismId = urlParams.get("organism");
+    let birthConfig = null;
+    if (childOrganismId) {
+        birthConfig = await idbGet("births", childOrganismId);
+        if (birthConfig) {
+            logUI(`[ecology] Child organism ${childOrganismId} — born from ${birthConfig.parent_id}`);
+        }
+    }
+
+    // Try to load corpus (fetch -> DB -> default)
     setStatus("loading corpus...");
     let fetched = await fetchCorpus(CFG.corpusUrl);
     if (fetched && fetched.length > 0) {
@@ -2800,8 +3283,33 @@ async function awaken() {
     _qbuf = new QuantumBuffer();
     _syntracker = new SyntropyTracker();
 
+    // Swarm ecology: register in BroadcastChannel mesh
+    const organismId = childOrganismId || `org_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    _swarm = new SwarmRegistry(organismId);
+    _swarm.register();
+    // Give peers a moment to respond, then discover
+    await new Promise(r => setTimeout(r, 200));
+    const peers = _swarm.discoverPeers();
+    if (peers.length > 0) {
+        logUI(`[ecology] Joined swarm. ${peers.length} peer(s) detected.`);
+    } else {
+        logUI("[ecology] First organism in the swarm.");
+    }
+
+    // Child: inherit burst_history from parent
+    if (birthConfig && birthConfig.burst_history) {
+        _syntracker.burstHistory = birthConfig.burst_history.slice();
+        logUI(`[ecology] Inherited ${_syntracker.burstHistory.length} burst records from parent.`);
+    }
+
+    // Clean up swarm on tab close
+    window.addEventListener("beforeunload", () => {
+        if (_swarm) _swarm.unregister();
+    });
+
     // Start background trainer
     _trainerRunning = true;
+    _tickCount = 0;
     setTimeout(trainerTick, 100);
 
     setStatus("alive");
@@ -2829,6 +3337,7 @@ if (typeof module !== "undefined" && module.exports) {
         CFG, softmaxProbsFloat, topKTopPSample, VectorValue, ScalarValue,
         backward, withNoGrad, MatrixParam, EvolvingTokenizer, GPT,
         extractCandidateSentences, reservoirMixKeep, normalizeText, rng,
+        headTypesForNHead, DeltaAdapter, SyntropyTracker, SwarmRegistry,
     };
 }
 

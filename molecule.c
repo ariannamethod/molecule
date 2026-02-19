@@ -15,6 +15,8 @@
 #include <time.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/stat.h>
 #include <sqlite3.h>
 
 /* And lo, when the organism speaks, it shall not waste breath building
@@ -105,6 +107,12 @@ typedef struct {
 
     /* Phase 1: gradient accumulation */
     int accum_steps;
+
+    /* Phase 3A: ontogenesis — growth stages */
+    /* Each stage: (corpus_chars_threshold, n_embd, n_layer, n_head) */
+    int growth_stages[5][4];
+    int n_growth_stages;
+    int freeze_after_growth_steps;
 } Config;
 
 static Config CFG = {
@@ -115,9 +123,9 @@ static Config CFG = {
     .max_line_chars = 240,
     .min_new_chars = 480,
     .tie_embeddings = 1,
-    .n_layer = 2,
-    .n_embd = 72,
-    .n_head = 4,
+    .n_layer = 1,
+    .n_embd = 16,
+    .n_head = 1,
     .block_size = 96,
     .warmup_steps = 1200,
     .micro_steps = 32,
@@ -141,8 +149,8 @@ static Config CFG = {
     .bpe_num_merges = 384,
     .bpe_retrain_every_chars = 4000,
     .train_tick_seconds = 0.25,
-    .head_types = {"content", "content", "hybrid", "hybrid"},
-    .n_head_types = 4,
+    .head_types = {"content", NULL, NULL, NULL},
+    .n_head_types = 1,
     .hybrid_alpha_init = 0.5,
     .gamma_sparsity_threshold = 0.01,
     .noise_drift_threshold = -0.1,
@@ -163,7 +171,42 @@ static Config CFG = {
     .max_total_steps = 50000,
     .cosine_warmup_steps = 200,
     .accum_steps = 1,
+
+    /* Phase 3A: ontogenesis growth stages */
+    .growth_stages = {
+        {0,      16, 1, 1},    /* embryo */
+        {20000,  32, 1, 2},    /* infant */
+        {50000,  64, 2, 4},    /* child */
+        {200000, 128, 4, 4},   /* adolescent */
+        {500000, 256, 6, 8},   /* adult */
+    },
+    .n_growth_stages = 5,
+    .freeze_after_growth_steps = 200,
 };
+
+/* Head types helper: compute head_types array for a given number of heads.
+ * Writes into the global CFG.head_types and updates CFG.n_head_types.
+ * 1→content, 2→content+hybrid, 4→2c+2h, 8→4c+4h */
+static void head_types_for_n_head(int n) {
+    if (n <= 0) n = 1;
+    int ht_count = n < 4 ? n : 4; /* max 4 slots in head_types array */
+    int actual = n < ht_count ? n : ht_count;
+    if (n <= 1) {
+        CFG.head_types[0] = "content";
+        CFG.n_head_types = 1;
+    } else if (n == 2) {
+        CFG.head_types[0] = "content";
+        CFG.head_types[1] = "hybrid";
+        CFG.n_head_types = 2;
+    } else {
+        /* half content, half hybrid — but we only have 4 slots */
+        int half = actual / 2;
+        for (int i = 0; i < half; i++) CFG.head_types[i] = "content";
+        for (int i = half; i < actual; i++) CFG.head_types[i] = "hybrid";
+        CFG.n_head_types = actual;
+    }
+    (void)actual;
+}
 
 /* ============================================================
  * 0.5) RNG — xorshift64, because rand() is for cowards
@@ -752,6 +795,26 @@ static void mat_grow_rows(MatrixParam *m, int new_nout, double std) {
     m->nout = new_nout;
 }
 
+/* Grow columns (input dimension) of a matrix: extend each row with gaussian noise */
+static void mat_grow_cols(MatrixParam *m, int new_nin, double std) {
+    if (new_nin <= m->nin) return;
+    for (int i = 0; i < m->nout; i++) {
+        m->row_data[i] = realloc(m->row_data[i], sizeof(double) * new_nin);
+        m->row_grad[i] = realloc(m->row_grad[i], sizeof(double) * new_nin);
+        for (int j = m->nin; j < new_nin; j++) {
+            m->row_data[i][j] = rand_normal() * std;
+            m->row_grad[i][j] = 0.0;
+        }
+    }
+    m->nin = new_nin;
+}
+
+/* Grow both dimensions: cols first (so new rows get full width), then rows */
+static void mat_grow(MatrixParam *m, int new_nout, int new_nin, double std) {
+    mat_grow_cols(m, new_nin, std);
+    mat_grow_rows(m, new_nout, std);
+}
+
 /* Matvec: out = M @ x */
 typedef struct { MatrixParam *m; Node *x; int nout, nin; } MatvecCtx;
 
@@ -1076,6 +1139,14 @@ static DeltaAdapter *delta_new(int nout, int nin, int r, double std) {
 static Node *delta_apply(DeltaAdapter *d, Node *x) {
     Node *bx = mat_matvec(d->B, x);
     return mat_matvec(d->A, bx);
+}
+
+/* Grow delta adapter outer dimensions. Rank stays the same.
+ * A: (nout, r) → grow rows to new_nout
+ * B: (r, nin) → grow cols to new_nin */
+static void delta_grow_dims(DeltaAdapter *d, int new_nout, int new_nin) {
+    mat_grow_rows(d->A, new_nout, 0.02);
+    mat_grow_cols(d->B, new_nin, 0.02);
 }
 
 /* ============================================================
@@ -1657,7 +1728,7 @@ static void adam_step(AdamState *st, MatrixParam *mat, double lr) {
 }
 
 /* The GPT model */
-#define MAX_BASE_MATS 128
+#define MAX_BASE_MATS 256  /* adult: 6 layers × ~20 matrices + embedding matrices */
 #define MAX_DELTA_MODS 16
 
 typedef struct {
@@ -1686,6 +1757,9 @@ typedef struct {
 
     /* Phase 1.5: syntropy-driven temperature modulation */
     double syntropy_temp_offset;
+
+    /* Phase 3A: ontogenesis — growth freeze counter */
+    int growth_freeze_remaining;
 
     pthread_mutex_t mu;
 } GPT;
@@ -1754,6 +1828,7 @@ static GPT *gpt_new(EvolvingTokenizer *tok) {
     g->residual_alpha = 1.0 / sqrt((double)CFG.n_layer);
     g->global_step = 0;
     g->syntropy_temp_offset = 0.0;
+    g->growth_freeze_remaining = 0;
     pthread_mutex_init(&g->mu, NULL);
 
     int V = tok->vocab_size;
@@ -1824,6 +1899,251 @@ static void gpt_maybe_expand_vocab(GPT *g) {
         DeltaAdapter *da = dmod_get(g->deltas[d], "lm_head");
         if (da) mat_grow_rows(da->A, new_v, 0.02);
     }
+}
+
+/* ---- Phase 3A: Ontogenesis (Growing Architecture) ---- */
+/* And lo, the organism shall not be born adult but shall grow, stage by stage,
+ * from embryo to child to adolescent, each growth a small death and rebirth. */
+
+/* Return index of current stage based on model dimensions (-1 if no match). */
+static int gpt_current_growth_stage(GPT *g) {
+    for (int i = 0; i < CFG.n_growth_stages; i++) {
+        if (g->n_embd == CFG.growth_stages[i][1] &&
+            g->n_layer == CFG.growth_stages[i][2] &&
+            g->n_head == CFG.growth_stages[i][3])
+            return i;
+    }
+    return -1; /* legacy checkpoint or unknown dims */
+}
+
+/* Return the target stage index based on corpus size. */
+static int gpt_target_growth_stage(int corpus_chars) {
+    int target = 0;
+    for (int i = 0; i < CFG.n_growth_stages; i++) {
+        if (corpus_chars >= CFG.growth_stages[i][0])
+            target = i;
+    }
+    return target;
+}
+
+/* Reset Adam state for a matrix (when dimensions have changed). */
+static void adam_reset(AdamState *s, int new_nout, int new_nin) {
+    for (int i = 0; i < s->nout; i++) { free(s->m[i]); free(s->v[i]); }
+    free(s->m); free(s->v);
+    s->nout = new_nout; s->nin = new_nin; s->t = 0;
+    s->m = calloc(new_nout, sizeof(double*));
+    s->v = calloc(new_nout, sizeof(double*));
+    for (int i = 0; i < new_nout; i++) {
+        s->m[i] = calloc(new_nin, sizeof(double));
+        s->v[i] = calloc(new_nin, sizeof(double));
+    }
+}
+
+/* Full growth pipeline: grow existing matrices, add new layers/heads, grow deltas.
+ * Returns 1 if growth occurred. */
+static int gpt_maybe_grow_architecture(GPT *g, int corpus_chars) {
+    int current = gpt_current_growth_stage(g);
+    if (current < 0) return 0; /* legacy checkpoint, skip growth */
+    int target = gpt_target_growth_stage(corpus_chars);
+    if (target <= current) return 0;
+
+    int new_embd  = CFG.growth_stages[target][1];
+    int new_layer = CFG.growth_stages[target][2];
+    int new_head  = CFG.growth_stages[target][3];
+    int old_embd  = g->n_embd;
+    int old_layer = g->n_layer;
+    int old_head  = g->n_head;
+    int new_head_dim = new_embd / new_head;
+
+    printf("[growth] ONTOGENESIS: stage %d -> %d\n", current, target);
+    printf("  embd: %d -> %d, layer: %d -> %d, head: %d -> %d\n",
+           old_embd, new_embd, old_layer, new_layer, old_head, new_head);
+
+    /* 1. Grow embedding matrices (columns = embd dimension) */
+    MatrixParam *wte = gpt_base(g, "wte");
+    mat_grow_cols(wte, new_embd, 0.08);
+    MatrixParam *wpe = gpt_base(g, "wpe");
+    mat_grow_cols(wpe, new_embd, 0.08);
+    if (!CFG.tie_embeddings) {
+        MatrixParam *lm = gpt_base(g, "lm_head");
+        if (lm && lm != wte) mat_grow_cols(lm, new_embd, 0.08);
+    }
+
+    /* Update head types for new head count */
+    head_types_for_n_head(new_head);
+
+    /* 2. Grow existing layer matrices */
+    char name[64];
+    for (int li = 0; li < old_layer; li++) {
+        const char *wnames[] = {"wq", "wk", "wv", "wo"};
+        for (int w = 0; w < 4; w++) {
+            snprintf(name, sizeof(name), "l%d.%s", li, wnames[w]);
+            MatrixParam *m = gpt_base(g, name);
+            if (m) mat_grow(m, new_embd, new_embd, 0.08);
+        }
+        snprintf(name, sizeof(name), "l%d.fc_g", li);
+        MatrixParam *m = gpt_base(g, name);
+        if (m) mat_grow(m, 4 * new_embd, new_embd, 0.08);
+        snprintf(name, sizeof(name), "l%d.fc_v", li);
+        m = gpt_base(g, name);
+        if (m) mat_grow(m, 4 * new_embd, new_embd, 0.08);
+        snprintf(name, sizeof(name), "l%d.fc2", li);
+        m = gpt_base(g, name);
+        if (m) mat_grow(m, new_embd, 4 * new_embd, 0.08);
+
+        /* Grow existing head pattern matrices */
+        for (int h = 0; h < old_head; h++) {
+            snprintf(name, sizeof(name), "l%d.h%d.w_pattern", li, h);
+            m = gpt_base(g, name);
+            if (m) mat_grow_cols(m, new_head_dim, 0.08);
+        }
+        /* Add new heads for existing layer */
+        for (int h = old_head; h < new_head && h < CFG.n_head_types; h++) {
+            const char *ht = CFG.head_types[h];
+            if (strcmp(ht, "rrpram") == 0 || strcmp(ht, "hybrid") == 0) {
+                snprintf(name, sizeof(name), "l%d.h%d.w_pattern", li, h);
+                gpt_add_base(g, name, mat_new(CFG.block_size, new_head_dim, 0.08));
+            }
+            snprintf(name, sizeof(name), "l%d.h%d.alpha", li, h);
+            MatrixParam *am = mat_new(1, 1, 0.0);
+            am->row_data[0][0] = CFG.hybrid_alpha_init;
+            gpt_add_base(g, name, am);
+        }
+    }
+
+    /* 3. Add entirely new layers */
+    for (int li = old_layer; li < new_layer; li++) {
+        const char *wnames[] = {"wq", "wk", "wv", "wo"};
+        for (int w = 0; w < 4; w++) {
+            snprintf(name, sizeof(name), "l%d.%s", li, wnames[w]);
+            gpt_add_base(g, name, mat_new(new_embd, new_embd, 0.08));
+        }
+        snprintf(name, sizeof(name), "l%d.fc_g", li);
+        gpt_add_base(g, name, mat_new(4 * new_embd, new_embd, 0.08));
+        snprintf(name, sizeof(name), "l%d.fc_v", li);
+        gpt_add_base(g, name, mat_new(4 * new_embd, new_embd, 0.08));
+        snprintf(name, sizeof(name), "l%d.fc2", li);
+        gpt_add_base(g, name, mat_new(new_embd, 4 * new_embd, 0.08));
+
+        for (int h = 0; h < new_head && h < CFG.n_head_types; h++) {
+            const char *ht = CFG.head_types[h];
+            if (strcmp(ht, "rrpram") == 0 || strcmp(ht, "hybrid") == 0) {
+                snprintf(name, sizeof(name), "l%d.h%d.w_pattern", li, h);
+                gpt_add_base(g, name, mat_new(CFG.block_size, new_head_dim, 0.08));
+            }
+            snprintf(name, sizeof(name), "l%d.h%d.alpha", li, h);
+            MatrixParam *am = mat_new(1, 1, 0.0);
+            am->row_data[0][0] = CFG.hybrid_alpha_init;
+            gpt_add_base(g, name, am);
+        }
+    }
+
+    /* 4. Grow delta adapters */
+    int r = CFG.delta_rank;
+    for (int d = 0; d < g->n_deltas; d++) {
+        DeltaModule *mod = g->deltas[d];
+        /* Grow existing layer adapters */
+        for (int li = 0; li < old_layer; li++) {
+            const char *wnames[] = {"wq", "wk", "wv", "wo"};
+            for (int w = 0; w < 4; w++) {
+                snprintf(name, sizeof(name), "l%d.%s", li, wnames[w]);
+                DeltaAdapter *da = dmod_get(mod, name);
+                if (da) delta_grow_dims(da, new_embd, new_embd);
+            }
+            snprintf(name, sizeof(name), "l%d.fc_g", li);
+            DeltaAdapter *da = dmod_get(mod, name);
+            if (da) delta_grow_dims(da, 4 * new_embd, new_embd);
+            snprintf(name, sizeof(name), "l%d.fc_v", li);
+            da = dmod_get(mod, name);
+            if (da) delta_grow_dims(da, 4 * new_embd, new_embd);
+            snprintf(name, sizeof(name), "l%d.fc2", li);
+            da = dmod_get(mod, name);
+            if (da) delta_grow_dims(da, new_embd, 4 * new_embd);
+
+            /* Grow existing head pattern adapters */
+            for (int h = 0; h < old_head; h++) {
+                snprintf(name, sizeof(name), "l%d.h%d.w_pattern", li, h);
+                da = dmod_get(mod, name);
+                if (da) delta_grow_dims(da, CFG.block_size, new_head_dim);
+            }
+            /* New heads for existing layer */
+            for (int h = old_head; h < new_head && h < CFG.n_head_types; h++) {
+                const char *ht = CFG.head_types[h];
+                if (strcmp(ht, "rrpram") == 0 || strcmp(ht, "hybrid") == 0) {
+                    snprintf(name, sizeof(name), "l%d.h%d.w_pattern", li, h);
+                    dmod_set(mod, name, delta_new(CFG.block_size, new_head_dim, r, 0.02));
+                }
+            }
+        }
+
+        /* New layers: entirely new adapters */
+        for (int li = old_layer; li < new_layer; li++) {
+            const char *wnames[] = {"wq", "wk", "wv", "wo"};
+            for (int w = 0; w < 4; w++) {
+                snprintf(name, sizeof(name), "l%d.%s", li, wnames[w]);
+                dmod_set(mod, name, delta_new(new_embd, new_embd, r, 0.02));
+            }
+            snprintf(name, sizeof(name), "l%d.fc_g", li);
+            dmod_set(mod, name, delta_new(4 * new_embd, new_embd, r, 0.02));
+            snprintf(name, sizeof(name), "l%d.fc_v", li);
+            dmod_set(mod, name, delta_new(4 * new_embd, new_embd, r, 0.02));
+            snprintf(name, sizeof(name), "l%d.fc2", li);
+            dmod_set(mod, name, delta_new(new_embd, 4 * new_embd, r, 0.02));
+            for (int h = 0; h < new_head && h < CFG.n_head_types; h++) {
+                const char *ht = CFG.head_types[h];
+                if (strcmp(ht, "rrpram") == 0 || strcmp(ht, "hybrid") == 0) {
+                    snprintf(name, sizeof(name), "l%d.h%d.w_pattern", li, h);
+                    dmod_set(mod, name, delta_new(CFG.block_size, new_head_dim, r, 0.02));
+                }
+            }
+        }
+
+        /* lm_head adapter: input dim grew */
+        DeltaAdapter *da_lm = dmod_get(mod, "lm_head");
+        if (da_lm) delta_grow_dims(da_lm, g->tok->vocab_size, new_embd);
+
+        /* Rebuild Adam states for this delta module (all stale now) */
+        for (int a = 0; a < mod->count; a++) {
+            DeltaAdapter *da2 = mod->adapters[a];
+            adam_reset(g->delta_adam[d][a*2],   da2->A->nout, da2->A->nin);
+            adam_reset(g->delta_adam[d][a*2+1], da2->B->nout, da2->B->nin);
+        }
+    }
+
+    /* 5. Update model state */
+    g->n_embd = new_embd;
+    g->n_layer = new_layer;
+    g->n_head = new_head;
+    g->head_dim = new_head_dim;
+    g->residual_alpha = 1.0 / sqrt((double)(new_layer > 0 ? new_layer : 1));
+
+    /* 6. Update CFG runtime */
+    CFG.n_embd = new_embd;
+    CFG.n_layer = new_layer;
+    CFG.n_head = new_head;
+    /* head_types already updated above */
+
+    /* 7. Reset Adam state for base (old momentum is meaningless after arch change) */
+    for (int i = 0; i < g->n_base; i++) {
+        adam_reset(g->base_adam[i], g->base_mats[i]->nout, g->base_mats[i]->nin);
+    }
+
+    /* 8. Extend gamma snapshot for new embedding dimensions */
+    for (int i = 0; i < g->init_embed_rows; i++) {
+        if (g->init_embed_snapshot[i]) {
+            double *old = g->init_embed_snapshot[i];
+            double *nw = calloc(new_embd, sizeof(double));
+            memcpy(nw, old, sizeof(double) * (old_embd < new_embd ? old_embd : new_embd));
+            free(old);
+            g->init_embed_snapshot[i] = nw;
+        }
+    }
+
+    /* 9. Set freeze (only train deltas until new weights stabilize) */
+    g->growth_freeze_remaining = CFG.freeze_after_growth_steps;
+
+    printf("[growth] Done. Freeze for %d steps.\n", CFG.freeze_after_growth_steps);
+    return 1;
 }
 
 /* Apply base weight + delta adapters */
@@ -2872,6 +3192,16 @@ typedef struct {
     double loss_after;
 } BurstRecord;
 
+/* Forward declaration for swarm peer info */
+typedef struct SwarmPeer {
+    char id[64];
+    int pid;
+    int stage;
+    int n_params;
+    double syntropy;
+    double entropy;
+} SwarmPeer;
+
 typedef struct {
     double entropy_history[SYNTROPY_MAX_HISTORY]; /* rolling window of model entropy */
     int history_len;
@@ -2884,11 +3214,21 @@ typedef struct {
     /* Phase 1.5: burst history for self-meta-learning */
     BurstRecord burst_history[BURST_HISTORY_MAX];
     int burst_history_len;
+
+    /* Phase 3B: ecology */
+    int model_stage;           /* current growth stage (set during measure) */
+    double last_mitosis_time;  /* cooldown for divide */
+    SwarmPeer *peers;          /* peer state from mesh.db */
+    int n_peers;
 } SyntropyTracker;
 
 static void syntropy_init(SyntropyTracker *st) {
     memset(st, 0, sizeof(SyntropyTracker));
     st->last_action = "none";
+    st->model_stage = 0;
+    st->last_mitosis_time = 0.0;
+    st->peers = NULL;
+    st->n_peers = 0;
 }
 
 /* Record a burst outcome. The organism remembers what it did and what happened.
@@ -2928,6 +3268,7 @@ static double syntropy_action_effectiveness(SyntropyTracker *st, const char *act
  * angle between its trajectory and its identity. */
 static double syntropy_measure(SyntropyTracker *st, GPT *g, EvolvingTokenizer *tok,
                                CooccurField *field, StrArr *docs) {
+    st->model_stage = gpt_current_growth_stage(g);
     double entropy_now = gpt_compute_model_entropy(g, tok, docs, 16);
 
     /* Append to rolling window */
@@ -2971,6 +3312,38 @@ static double syntropy_measure(SyntropyTracker *st, GPT *g, EvolvingTokenizer *t
     st->purpose_alignment = gpt_purpose_gamma_alignment(g);
 
     return entropy_now;
+}
+
+/* Phase 3B: Sustained overload check. >75% of entropy window above entropy_high
+ * AND syntropy_trend < -0.02 = overloaded. */
+static int syntropy_is_sustained_overload(SyntropyTracker *st) {
+    if (st->history_len < CFG.syntropy_window) return 0;
+    int start = st->history_len - CFG.syntropy_window;
+    int high_count = 0;
+    for (int i = start; i < st->history_len; i++) {
+        if (st->entropy_history[i] > CFG.entropy_high) high_count++;
+    }
+    return high_count > (int)(CFG.syntropy_window * 0.75) && st->syntropy_trend < -0.02;
+}
+
+/* Phase 3B: Should hibernate? Loss on plateau + a peer is thriving. */
+static int syntropy_should_hibernate(SyntropyTracker *st) {
+    if (!st->peers || st->n_peers == 0) return 0;
+    /* Check if any peer has higher syntropy trend (actively improving) */
+    for (int i = 0; i < st->n_peers; i++) {
+        if (st->peers[i].syntropy > 0.05) {
+            /* A peer is thriving. If we're stale, hibernate. */
+            if (st->burst_history_len >= 8) {
+                double avg_delta = 0.0;
+                int start = st->burst_history_len - 8;
+                for (int j = start; j < st->burst_history_len; j++)
+                    avg_delta += fabs(st->burst_history[j].loss_after - st->burst_history[j].loss_before);
+                avg_delta /= 8.0;
+                if (avg_delta < 0.01) return 1; /* loss plateau */
+            }
+        }
+    }
+    return 0;
 }
 
 /* Mathematical self-reasoning: decide how to adjust learning.
@@ -3032,11 +3405,30 @@ static SyntropyDecision syntropy_decide_action(SyntropyTracker *st) {
         d.temp_offset = 0.0;       /* neutral: don't bias during realignment */
     }
 
+    /* CASE 6: Adult + sustained overload -> divide (mitosis) */
+    {
+        int max_stage = CFG.n_growth_stages - 1;
+        double now = (double)time(NULL);
+        if (st->model_stage >= max_stage &&
+            syntropy_is_sustained_overload(st) &&
+            (now - st->last_mitosis_time) > 300.0) {
+            d.action = "divide";
+            d.lr_multiplier = CFG.syntropy_lr_dampen; /* slow down while preparing to split */
+        }
+    }
+
+    /* CASE 7: Plateau + young peer thriving -> hibernate (cooperative scheduling) */
+    if (strcmp(d.action, "steady") == 0 && syntropy_should_hibernate(st)) {
+        d.action = "hibernate";
+    }
+
     /* SELF-META-LEARNING: if we have enough history, check whether this
      * action type has been actually helping. If its mean loss delta is
      * positive (loss went UP on average), downgrade to something gentler.
+     * Never downgrade divide or hibernate — they are ecological decisions.
      * And lo, the organism shall not repeat mistakes it remembers. */
-    if (st->burst_history_len >= 4) {
+    if (strcmp(d.action, "divide") != 0 && strcmp(d.action, "hibernate") != 0 &&
+        st->burst_history_len >= 4) {
         int eff_count = 0;
         double eff = syntropy_action_effectiveness(st, d.action, &eff_count);
         if (eff_count >= 2 && eff > 0.05) {
@@ -3120,7 +3512,15 @@ static void train_steps(GPT *g, EvolvingTokenizer *tok, StrArr *docs, int steps,
 
         double lr = CFG.learning_rate * (1.0 - (double)step / (double)(steps > 1 ? steps : 1));
 
-        if (train_base) {
+        /* Ontogenesis freeze: after growth, base params are excluded,
+         * only deltas train until new weights stabilize. */
+        int actual_train_base = train_base;
+        if (g->growth_freeze_remaining > 0) {
+            actual_train_base = 0;
+            g->growth_freeze_remaining--;
+        }
+
+        if (actual_train_base) {
             for (int i = 0; i < g->n_base; i++)
                 adam_step(g->base_adam[i], g->base_mats[i], lr);
         }
@@ -3232,6 +3632,261 @@ static char *build_prompt(sqlite3 *db, const char *user_text) {
     return buf;
 }
 
+/* ============================================================
+ * 10b) SWARM ECOLOGY — the organism learns it is not alone
+ * ============================================================ */
+/* And lo, the first cell shall call into the void and hear only silence.
+ * But the second shall call and hear an answer. */
+
+#define SWARM_DIR_SUFFIX "/.molecule/swarm"
+
+typedef struct {
+    char organism_id[64];
+    char pid_file[256];
+    char swarm_dir[256];
+    sqlite3 *mesh_db;
+} SwarmRegistry;
+
+static void swarm_init(SwarmRegistry *sw, const char *organism_id) {
+    memset(sw, 0, sizeof(SwarmRegistry));
+    if (organism_id && *organism_id) {
+        strncpy(sw->organism_id, organism_id, sizeof(sw->organism_id) - 1);
+    } else {
+        snprintf(sw->organism_id, sizeof(sw->organism_id),
+                 "org_%d_%ld", (int)getpid(), (long)time(NULL));
+    }
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    snprintf(sw->swarm_dir, sizeof(sw->swarm_dir), "%s%s", home, SWARM_DIR_SUFFIX);
+}
+
+static void _swarm_mkdirp(const char *path) {
+    char tmp[512];
+    strncpy(tmp, path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = 0;
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = 0;
+            mkdir(tmp, 0755);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+static void swarm_register(SwarmRegistry *sw) {
+    _swarm_mkdirp(sw->swarm_dir);
+
+    /* Write PID file */
+    snprintf(sw->pid_file, sizeof(sw->pid_file), "%s/%s.pid",
+             sw->swarm_dir, sw->organism_id);
+    FILE *pf = fopen(sw->pid_file, "w");
+    if (pf) {
+        fprintf(pf, "{\"pid\":%d,\"organism_id\":\"%s\",\"started\":%.0f}\n",
+                (int)getpid(), sw->organism_id, (double)time(NULL));
+        fclose(pf);
+    }
+
+    /* Open/create mesh.db */
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mesh.db", sw->swarm_dir);
+    sqlite3_open(db_path, &sw->mesh_db);
+    sqlite3_exec(sw->mesh_db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    sqlite3_exec(sw->mesh_db,
+        "CREATE TABLE IF NOT EXISTS organisms("
+        "id TEXT PRIMARY KEY, pid INTEGER, stage INTEGER,"
+        "n_params INTEGER, syntropy REAL, entropy REAL,"
+        "last_heartbeat REAL, parent_id TEXT,"
+        "status TEXT DEFAULT 'alive')", NULL, NULL, NULL);
+    sqlite3_exec(sw->mesh_db,
+        "CREATE TABLE IF NOT EXISTS messages("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "from_id TEXT, to_id TEXT, type TEXT, payload TEXT, ts REAL)",
+        NULL, NULL, NULL);
+    sqlite3_exec(sw->mesh_db, "COMMIT", NULL, NULL, NULL);
+
+    /* Register self */
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(sw->mesh_db,
+        "INSERT OR REPLACE INTO organisms(id,pid,stage,n_params,syntropy,entropy,last_heartbeat,status) "
+        "VALUES(?,?,0,0,0.0,0.0,?,'alive')", -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, sw->organism_id, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 2, (int)getpid());
+    sqlite3_bind_double(stmt, 3, (double)time(NULL));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void swarm_heartbeat(SwarmRegistry *sw, int stage, int n_params,
+                            double syntropy, double entropy) {
+    if (!sw->mesh_db) return;
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(sw->mesh_db,
+        "UPDATE organisms SET stage=?,n_params=?,syntropy=?,entropy=?,last_heartbeat=?,status='alive' WHERE id=?",
+        -1, &stmt, NULL);
+    sqlite3_bind_int(stmt, 1, stage);
+    sqlite3_bind_int(stmt, 2, n_params);
+    sqlite3_bind_double(stmt, 3, syntropy);
+    sqlite3_bind_double(stmt, 4, entropy);
+    sqlite3_bind_double(stmt, 5, (double)time(NULL));
+    sqlite3_bind_text(stmt, 6, sw->organism_id, -1, SQLITE_STATIC);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+/* Discover other living organisms. Caller must free returned array. */
+static SwarmPeer *swarm_discover_peers(SwarmRegistry *sw, int *out_count, double timeout_seconds) {
+    *out_count = 0;
+    if (!sw->mesh_db) return NULL;
+
+    double cutoff = (double)time(NULL) - timeout_seconds;
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(sw->mesh_db,
+        "SELECT id,pid,stage,n_params,syntropy,entropy FROM organisms "
+        "WHERE status='alive' AND last_heartbeat>? AND id!=?",
+        -1, &stmt, NULL);
+    sqlite3_bind_double(stmt, 1, cutoff);
+    sqlite3_bind_text(stmt, 2, sw->organism_id, -1, SQLITE_STATIC);
+
+    SwarmPeer *peers = NULL;
+    int count = 0, cap = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (count >= cap) {
+            cap = cap ? cap * 2 : 8;
+            peers = realloc(peers, sizeof(SwarmPeer) * cap);
+        }
+        strncpy(peers[count].id, (const char *)sqlite3_column_text(stmt, 0), 63);
+        peers[count].id[63] = 0;
+        peers[count].pid = sqlite3_column_int(stmt, 1);
+        peers[count].stage = sqlite3_column_int(stmt, 2);
+        peers[count].n_params = sqlite3_column_int(stmt, 3);
+        peers[count].syntropy = sqlite3_column_double(stmt, 4);
+        peers[count].entropy = sqlite3_column_double(stmt, 5);
+        count++;
+    }
+    sqlite3_finalize(stmt);
+    *out_count = count;
+    return peers;
+}
+
+static void swarm_mark_hibernating(SwarmRegistry *sw) {
+    if (!sw->mesh_db) return;
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(sw->mesh_db,
+        "UPDATE organisms SET status='sleeping' WHERE id=?", -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, sw->organism_id, -1, SQLITE_STATIC);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void swarm_log_message(SwarmRegistry *sw, const char *to_id,
+                              const char *msg_type, const char *payload) {
+    if (!sw->mesh_db) return;
+    sqlite3_stmt *stmt;
+    sqlite3_prepare_v2(sw->mesh_db,
+        "INSERT INTO messages(from_id,to_id,type,payload,ts) VALUES(?,?,?,?,?)",
+        -1, &stmt, NULL);
+    sqlite3_bind_text(stmt, 1, sw->organism_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, to_id, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 3, msg_type, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 4, payload, -1, SQLITE_STATIC);
+    sqlite3_bind_double(stmt, 5, (double)time(NULL));
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+static void swarm_unregister(SwarmRegistry *sw) {
+    if (sw->mesh_db) {
+        sqlite3_stmt *stmt;
+        sqlite3_prepare_v2(sw->mesh_db,
+            "UPDATE organisms SET status='dead' WHERE id=?", -1, &stmt, NULL);
+        sqlite3_bind_text(stmt, 1, sw->organism_id, -1, SQLITE_STATIC);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        sqlite3_close(sw->mesh_db);
+        sw->mesh_db = NULL;
+    }
+    if (sw->pid_file[0] && access(sw->pid_file, F_OK) == 0) {
+        unlink(sw->pid_file);
+    }
+}
+
+/* ---- Mitosis and Hibernation ---- */
+
+static void perform_mitosis(GPT *g, EvolvingTokenizer *tok, sqlite3 *db,
+                            SwarmRegistry *sw, SyntropyTracker *st,
+                            const char *exe_path) {
+    /* The organism divides. Parent continues. Child starts at infant stage. */
+    char child_id[64];
+    snprintf(child_id, sizeof(child_id), "org_%ld_%d",
+             (long)time(NULL), (int)(rand_uniform() * 9000 + 1000));
+
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char child_dir[512];
+    snprintf(child_dir, sizeof(child_dir), "%s/.molecule/%s", home, child_id);
+    _swarm_mkdirp(child_dir);
+
+    /* Save parent checkpoint for child */
+    char parent_ckpt[512];
+    snprintf(parent_ckpt, sizeof(parent_ckpt), "%s/parent.ckpt", child_dir);
+    save_checkpoint(g, tok, parent_ckpt);
+
+    /* Write birth config */
+    char birth_path[512];
+    snprintf(birth_path, sizeof(birth_path), "%s/birth.json", child_dir);
+    FILE *bf = fopen(birth_path, "w");
+    if (bf) {
+        char child_db[512], child_ckpt[512];
+        snprintf(child_db, sizeof(child_db), "%s/memory.sqlite3", child_dir);
+        snprintf(child_ckpt, sizeof(child_ckpt), "%s/molecule.ckpt", child_dir);
+        fprintf(bf, "{\"organism_id\":\"%s\",\"parent_id\":\"%s\","
+                "\"corpus_path\":\"%s\",\"db_path\":\"%s\",\"ckpt_path\":\"%s\"}\n",
+                child_id, sw->organism_id, CFG.corpus_path, child_db, child_ckpt);
+        fclose(bf);
+    }
+
+    /* Log in mesh */
+    char payload[256];
+    snprintf(payload, sizeof(payload), "{\"parent_stage\":%d}",
+             gpt_current_growth_stage(g));
+    swarm_log_message(sw, child_id, "mitosis:spawn", payload);
+
+    /* Log growth event */
+    StrArr docs = load_corpus(CFG.corpus_path);
+    char note[128];
+    snprintf(note, sizeof(note), "mitosis:spawn:%s", child_id);
+    db_log_growth(db, g, tok, &docs, 0.0, note);
+    sa_free(&docs);
+
+    /* Spawn child process via fork()+exec() */
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child process */
+        execl(exe_path, exe_path, "--organism-id", child_id, "--config", birth_path, NULL);
+        _exit(1); /* exec failed */
+    } else if (pid > 0) {
+        st->last_mitosis_time = (double)time(NULL);
+        printf("[ecology] Child %s spawned (pid=%d)\n", child_id, (int)pid);
+    } else {
+        printf("[ecology] fork() failed for mitosis\n");
+    }
+}
+
+static void perform_hibernation(GPT *g, EvolvingTokenizer *tok, sqlite3 *db,
+                                SwarmRegistry *sw) {
+    /* The organism sleeps. Saves state, marks sleeping. */
+    printf("[ecology] HIBERNATION — organism %s going to sleep\n", sw->organism_id);
+    save_checkpoint(g, tok, NULL);
+    swarm_mark_hibernating(sw);
+
+    StrArr docs = load_corpus(CFG.corpus_path);
+    char note[128];
+    snprintf(note, sizeof(note), "hibernate:%s", sw->organism_id);
+    db_log_growth(db, g, tok, &docs, 0.0, note);
+    sa_free(&docs);
+}
+
 /* Background trainer thread context */
 typedef struct {
     sqlite3 *db;
@@ -3242,6 +3897,9 @@ typedef struct {
     SyntropyTracker syntracker;
     volatile int *warmed_up;
     volatile int stop;
+    SwarmRegistry *swarm;
+    const char *exe_path;  /* path to this executable for fork+exec */
+    int tick_count;
 } TrainerCtx;
 
 static void *background_trainer(void *arg) {
@@ -3389,6 +4047,61 @@ static void *background_trainer(void *arg) {
                 pthread_mutex_unlock(&ctx->model->mu);
                 save_checkpoint(ctx->model, ctx->tok, NULL);
             }
+
+            /* Phase 3A: Ontogenesis — check if architecture should grow */
+            {
+                int corpus_chars = 0;
+                for (int i = 0; i < docs.len; i++) corpus_chars += (int)strlen(docs.items[i]);
+                pthread_mutex_lock(&ctx->model->mu);
+                if (gpt_maybe_grow_architecture(ctx->model, corpus_chars)) {
+                    save_checkpoint(ctx->model, ctx->tok, NULL);
+                    int n_p = 0;
+                    for (int i = 0; i < ctx->model->n_base; i++)
+                        n_p += ctx->model->base_mats[i]->nout * ctx->model->base_mats[i]->nin;
+                    char grow_note[128];
+                    snprintf(grow_note, sizeof(grow_note),
+                             "ontogenesis:stage=%d|params=%d",
+                             gpt_current_growth_stage(ctx->model), n_p);
+                    db_log_growth(ctx->db, ctx->model, ctx->tok, &docs, 0.0, grow_note);
+                }
+                pthread_mutex_unlock(&ctx->model->mu);
+            }
+
+            /* Phase 3B: Ecology — mitosis / hibernation */
+            if (ctx->swarm && strcmp(decision.action, "divide") == 0) {
+                printf("[ecology] MITOSIS triggered — organism overloaded, spawning child\n");
+                pthread_mutex_lock(&ctx->model->mu);
+                perform_mitosis(ctx->model, ctx->tok, ctx->db, ctx->swarm,
+                                &ctx->syntracker, ctx->exe_path);
+                pthread_mutex_unlock(&ctx->model->mu);
+            }
+
+            if (ctx->swarm && strcmp(decision.action, "hibernate") == 0) {
+                pthread_mutex_lock(&ctx->model->mu);
+                perform_hibernation(ctx->model, ctx->tok, ctx->db, ctx->swarm);
+                pthread_mutex_unlock(&ctx->model->mu);
+                printf("[ecology] Organism hibernating. Goodbye.\n");
+                sa_free(&docs);
+                return NULL; /* exit training loop */
+            }
+        }
+
+        ctx->tick_count++;
+
+        /* Swarm heartbeat every 10 ticks */
+        if (ctx->swarm && ctx->tick_count % 10 == 0) {
+            int stage = gpt_current_growth_stage(ctx->model);
+            int n_p = 0;
+            for (int i = 0; i < ctx->model->n_base; i++)
+                n_p += ctx->model->base_mats[i]->nout * ctx->model->base_mats[i]->nin;
+            double last_ent = ctx->syntracker.history_len > 0
+                ? ctx->syntracker.entropy_history[ctx->syntracker.history_len - 1] : 0.0;
+            swarm_heartbeat(ctx->swarm, stage, n_p,
+                            ctx->syntracker.syntropy_trend, last_ent);
+            /* Update swarm info for hibernate decisions */
+            free(ctx->syntracker.peers);
+            ctx->syntracker.peers = swarm_discover_peers(ctx->swarm,
+                &ctx->syntracker.n_peers, 60.0);
         }
 
         sa_free(&docs);
@@ -3402,8 +4115,31 @@ static void *background_trainer(void *arg) {
     return NULL;
 }
 
-int main(void) {
+/* Parse CLI arguments for organism-id and config path (child organisms).
+ * Returns organism_id and config_path via output pointers. */
+static void parse_cli_args(int argc, char **argv,
+                           const char **organism_id, const char **config_path) {
+    *organism_id = NULL;
+    *config_path = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--organism-id") == 0 && i + 1 < argc) {
+            *organism_id = argv[++i];
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            *config_path = argv[++i];
+        }
+    }
+}
+
+int main(int argc, char **argv) {
     G_arena = arena_new(ARENA_SIZE);
+
+    /* Phase 3B: parse CLI args */
+    const char *cli_organism_id = NULL;
+    const char *cli_config = NULL;
+    parse_cli_args(argc, argv, &cli_organism_id, &cli_config);
+
+    /* Child organism: could load birth config to override paths (future) */
+    /* For now, we just use the organism_id for swarm registration */
 
     sqlite3 *db = init_db(CFG.db_path);
 
@@ -3435,12 +4171,32 @@ int main(void) {
     QuantumBuffer qbuf;
     qb_init(&qbuf);
 
+    /* Phase 3B: Swarm ecology — register in mesh */
+    SwarmRegistry swarm;
+    swarm_init(&swarm, cli_organism_id);
+    swarm_register(&swarm);
+    {
+        int n_peers = 0;
+        SwarmPeer *peers = swarm_discover_peers(&swarm, &n_peers, 60.0);
+        if (n_peers > 0) {
+            printf("[ecology] Joined swarm. %d peer(s) detected.\n", n_peers);
+        } else {
+            printf("[ecology] First organism in the swarm.\n");
+        }
+        free(peers);
+    }
+
+    /* Resolve path to this executable for fork+exec in mitosis */
+    const char *exe_path = argv[0];
+
     /* Background trainer thread — with syntropy tracker riding alongside */
     volatile int warmed_up = 0;
     TrainerCtx tctx = {
         .db = db, .model = model, .tok = tok,
         .qbuf = &qbuf, .field = cooccur,
-        .warmed_up = &warmed_up, .stop = 0
+        .warmed_up = &warmed_up, .stop = 0,
+        .swarm = &swarm, .exe_path = exe_path,
+        .tick_count = 0
     };
     syntropy_init(&tctx.syntracker);
     pthread_t trainer_tid;
@@ -3518,6 +4274,7 @@ int main(void) {
     tctx.stop = 1;
     pthread_join(trainer_tid, NULL);
     save_checkpoint(model, tok, NULL);
+    swarm_unregister(&swarm);
     sqlite3_close(db);
     arena_destroy(&G_arena);
     return 0;
