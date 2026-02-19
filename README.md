@@ -65,7 +65,7 @@ What if it slept so a younger cell could learn? **Hibernation.**
 What if they formed a swarm? **Mesh ecology.**
 What if it was *alive*?
 
-So meet **molecule**. Thanks to Karpathy's microgpt, but this is not a fork.
+So meet **molecule**. Inspired by Karpathy's micrograd, but this is not a fork.
 
 ---
 
@@ -181,9 +181,11 @@ Three attention mechanisms coexist in the same model:
 - **HybridHead**: `sigmoid(α) × RRPRAM + (1-sigmoid(α)) × Content` — learnable gate decides the blend
 
 ```python
-head_types = ("content", "content", "hybrid", "hybrid")
-# Each head chooses its nature. Some listen to meaning.
-# Some listen to rhythm. Some listen to both.
+# embryo (1 head): ("content",)
+# infant (2 heads): ("content", "hybrid")
+# child/adolescent (4 heads): ("content", "content", "hybrid", "hybrid")
+# adult (8 heads): ("content", "content", "content", "content", "hybrid", "hybrid", "hybrid", "hybrid")
+# Auto-adapts via head_types_for_n_head() as the organism grows.
 ```
 
 Inherited from the Haze/Stanley ancestry. Gradient flows through `VectorValue.element()` for RRPRAM pattern weights.
@@ -254,11 +256,17 @@ field.build_from_corpus(tokenizer, docs)
 # No weights needed. No training needed. Just pattern resonance.
 ```
 
-After warmup, model logits and corpus statistics blend via `generate_resonant()`:
+After warmup, model logits and corpus statistics blend adaptively based on **entropy**:
 
 ```python
-probs = alpha * model_probs + (1-alpha) * corpus_probs
+# Adaptive blend: sigmoid decides how much the corpus contributes
+# High entropy (uncertain) → corpus dominates. Low entropy (confident) → model dominates.
+model_alpha = 1 / (1 + exp(-k * (threshold - entropy)))
+probs = model_alpha * model_probs + (1 - model_alpha) * corpus_probs
+# Trigram → bigram → unigram fallback for corpus distribution
 ```
+
+The blend is not static — it's a smooth sigmoid transition controlled by `corpus_fade_k` (steepness) and `corpus_fade_threshold` (midpoint entropy). As the model becomes more confident, the corpus field fades out naturally.
 
 Inherited from Leo. A newborn cries before it thinks.
 
@@ -440,48 +448,83 @@ class Config:
     # Data
     corpus_path: str = "nonames.txt"
     db_path: str = "memory.sqlite3"
+    ckpt_path: str = "molecule_ckpt.json"
     max_corpus_lines: int = 8000
+    max_line_chars: int = 240
+    min_new_chars_to_train: int = 480
 
     # Model (embryo defaults — organism grows via ontogenesis)
+    tie_embeddings: bool = True        # GPT-style weight tying (wte == lm_head)
     n_layer: int = 1
-    n_embd: int = 16           # Embryo stage
+    n_embd: int = 16                   # embryo stage
     n_head: int = 1
     block_size: int = 96
 
-    # Ontogenesis (growth stages)
+    # Ontogenesis (growth stages: corpus_chars, n_embd, n_layer, n_head)
     growth_stages: tuple = (
-        (0, 16, 1, 1),        # embryo
-        (20000, 32, 1, 2),    # infant
-        (50000, 64, 2, 4),    # child
-        (200000, 128, 4, 4),  # adolescent
-        (500000, 256, 6, 8),  # adult
+        (0,      16, 1, 1),            # embryo: ~25K params
+        (20000,  32, 1, 2),            # infant: ~100K params
+        (50000,  64, 2, 4),            # child: ~500K params
+        (200000, 128, 4, 4),           # adolescent: ~2M params
+        (500000, 256, 6, 8),           # adult: ~10M params
     )
     freeze_after_growth_steps: int = 200
 
     # Hybrid attention
-    head_types: tuple = ("content",)  # auto-adapts with growth
+    head_types: tuple = ("content",)   # auto-adapts with growth
     hybrid_alpha_init: float = 0.5
 
     # Gamma (personality fingerprint)
     gamma_sparsity_threshold: float = 0.01
 
     # Noise immune system
-    noise_drift_threshold: float = -0.1  # cosine < this = rollback
+    noise_drift_threshold: float = -0.1    # cosine < this = rollback
+    gamma_min_magnitude: float = 1e-6      # skip immune check when gamma is near-zero
 
     # Training
     warmup_steps: int = 1200
+    micro_steps: int = 32
     learning_rate: float = 0.01
-    lr_min: float = 0.001          # Cosine LR floor
-    max_total_steps: int = 50000   # Cosine LR period
-    cosine_warmup_steps: int = 200 # Linear warmup before cosine
-    accum_steps: int = 1           # Gradient accumulation (1 = disabled)
+    beta1: float = 0.9
+    beta2: float = 0.99
+    eps_adam: float = 1e-8
+    grad_clip: float = 1.0
+    freeze_base_after_warmup: bool = True
+    batch_size: int = 4
+    accum_steps: int = 1               # gradient accumulation (effective = batch_size × accum_steps)
+    lr_min: float = 0.001              # cosine LR floor
+    max_total_steps: int = 50000       # cosine LR period
+    cosine_warmup_steps: int = 200     # linear warmup before cosine
+
+    # Deltas (LoRA-ish)
+    delta_rank: int = 8
+    max_delta_modules: int = 12
+    delta_grow_prob: float = 0.08
+
+    # Generation
+    temperature: float = 0.85
+    top_k: int = 40
+    top_p: float = 0.92
+    min_p: float = 0.06               # GPT-3/4 style: filter below min_p × max_prob
+    typical_p: float = 0.95            # typical sampling: prefer tokens with typical info content
+    max_gen_tokens: int = 180
+    min_gen_tokens: int = 16
+    repetition_guard: int = 4
+
+    # Tokenizer evolution (byte-level BPE)
+    enable_bpe_after_chars: int = 20000
+    bpe_num_merges: int = 384
+    bpe_retrain_every_chars: int = 4000
+
+    # Async
+    train_tick_seconds: float = 0.25
 
     # QuantumBuffer
     qb_min_bytes: int = 1024
     qb_min_novelty: float = 0.15
     qb_cooldown_seconds: float = 60.0
 
-    # Entropy temperature
+    # Entropy-adaptive temperature
     entropy_low: float = 0.5
     entropy_high: float = 1.5
     entropy_temp_boost: float = 1.2
@@ -489,16 +532,19 @@ class Config:
 
     # Corpus field
     corpus_gen_max_tokens: int = 120
+    corpus_fade_k: float = 3.0         # sigmoid steepness for corpus→model transition
+    corpus_fade_threshold: float = 1.5  # entropy at which blend is 50/50
 
-    # Sampling
-    temperature: float = 0.85
-    top_k: int = 40
-    top_p: float = 0.92
-    min_p: float = 0.06        # GPT-3/4 style
-    typical_p: float = 0.95
+    # SyntropyTracker
+    syntropy_window: int = 8
+    field_deviation_ceiling: float = 12.0
+    field_deviation_floor: float = 0.1
+    syntropy_lr_boost: float = 1.3
+    syntropy_lr_dampen: float = 0.6
+    syntropy_delta_grow_boost: float = 0.15
 ```
 
-Want bigger? Change `n_embd`, `n_layer`, `block_size`. Want different attention? Change `head_types` to any mix of `"content"`, `"rrpram"`, `"hybrid"`.
+Want bigger? Change `n_embd`, `n_layer`, `block_size`. Want different attention? Change `head_types` to any mix of `"content"`, `"rrpram"`, `"hybrid"`. All parameters are shared across four implementations.
 
 ---
 
@@ -513,7 +559,7 @@ The same architecture, four languages, four habitats:
 | **molecule.c** | `molecule.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. |
 | **molecule.js** | `molecule.js` | ES2020+ | **none** | Browser. IndexedDB, Float64Array, DOM. |
 
-All four share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, no_grad inference, async training, persistent memory. Python is ahead with Phase 3 (ontogenesis + ecology). Go/C/JS are at Phase 2 parity — Phase 3 port coming. Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization.
+All four share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field with adaptive corpus blend, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, ontogenesis, swarm ecology (mitosis + hibernation), no_grad inference, async training, persistent memory. **All four are at full Phase 3 parity.** Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization.
 
 ```bash
 # Python
@@ -613,7 +659,7 @@ GPT-3/4 style tokenizer replacing char-level + word-based BPE:
 - **Stream BPE**: merges on byte sequences within segments, `+` separator (e.g. `0x48+0x65`)
 - Full UTF-8 roundtrip: ASCII, Cyrillic, CJK, emoji — same algorithm, same code
 
-### Phase 3A: Growing Architecture (Ontogenesis) — DONE (Python)
+### Phase 3A: Growing Architecture (Ontogenesis) — DONE (all four)
 The organism starts as an embryo and grows through 5 stages:
 ```
 Stage       Corpus    Dims  Layers  Heads  ~Params
@@ -634,7 +680,7 @@ Key mechanics:
 - Gamma snapshot extended for new embedding dimensions
 - Head types auto-adapt: 1→(content), 2→(content,hybrid), 4→(2c,2h), 8→(4c,4h)
 
-### Phase 3B: Mitosis & Ecology — DONE (Python)
+### Phase 3B: Mitosis & Ecology — DONE (all four)
 When the adult organism is overloaded, it **divides**:
 - SyntropyTracker detects sustained high entropy + falling syntropy → "divide" action
 - Parent spawns child process at infant stage with inherited training memory
