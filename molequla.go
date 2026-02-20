@@ -4047,11 +4047,10 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 			}
 		}
 
-		// Adaptive blend: model takes over as it becomes more confident (same sigmoid as GenerateSentence)
-		adaptiveModelWeight := 1.0 / (1.0 + math.Exp(-CFG.CorpusFadeK*(CFG.CorpusFadeThreshold-entropy)))
+		// Blend model and corpus probs using caller's alpha
 		blended := make([]float64, tok.VocabSize)
 		for i := 0; i < tok.VocabSize && i < len(modelProbs); i++ {
-			blended[i] = adaptiveModelWeight*modelProbs[i] + (1.0-adaptiveModelWeight)*corpusProbs[i]
+			blended[i] = modelAlpha*modelProbs[i] + (1.0-modelAlpha)*corpusProbs[i]
 		}
 
 		// Consciousness: pattern breaking (Feature 2)
