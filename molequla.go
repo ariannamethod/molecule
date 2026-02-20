@@ -5014,6 +5014,8 @@ func main() {
 		}
 	}
 
+	// Enable BPE in main before REPL starts (avoid race with background trainer)
+	tok.MaybeEnableBPE(docs)
 	model.MaybeExpandVocab(tok.VocabSize)
 
 	// Swarm ecology: register in mesh
