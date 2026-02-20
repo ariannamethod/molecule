@@ -1169,6 +1169,8 @@ type EvolvingTokenizer struct {
 	Merges       []MergePair
 	MergeToTok   map[MergePair]string
 	TrainedChars int
+
+	mu sync.RWMutex // protects concurrent access (background BPE train vs Encode)
 }
 
 func NewEvolvingTokenizer(docs []string) *EvolvingTokenizer {
@@ -1268,12 +1270,14 @@ func tokenToBytes(tok string) []byte {
 }
 
 func (t *EvolvingTokenizer) MaybeEnableBPE(docs []string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	totalChars := 0
 	for _, d := range docs {
 		totalChars += len(d)
 	}
 	if !t.BPEEnabled && totalChars >= CFG.EnableBPEAfterChars {
-		t.TrainBPE(docs, CFG.BPENumMerges)
+		t.trainBPELocked(docs, CFG.BPENumMerges)
 		t.BPEEnabled = true
 		t.TrainedChars = totalChars
 		return true
@@ -1282,6 +1286,8 @@ func (t *EvolvingTokenizer) MaybeEnableBPE(docs []string) bool {
 }
 
 func (t *EvolvingTokenizer) MaybeRetrainBPE(docs []string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if !t.BPEEnabled {
 		return false
 	}
@@ -1290,7 +1296,7 @@ func (t *EvolvingTokenizer) MaybeRetrainBPE(docs []string) bool {
 		totalChars += len(d)
 	}
 	if totalChars-t.TrainedChars >= CFG.BPERetrainEveryChars {
-		t.TrainBPE(docs, CFG.BPENumMerges)
+		t.trainBPELocked(docs, CFG.BPENumMerges)
 		t.TrainedChars = totalChars
 		return true
 	}
@@ -1298,6 +1304,12 @@ func (t *EvolvingTokenizer) MaybeRetrainBPE(docs []string) bool {
 }
 
 func (t *EvolvingTokenizer) TrainBPE(docs []string, numMerges int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.trainBPELocked(docs, numMerges)
+}
+
+func (t *EvolvingTokenizer) trainBPELocked(docs []string, numMerges int) {
 	text := strings.Join(docs, " ")
 	if len(text) == 0 {
 		return
@@ -1432,6 +1444,8 @@ func (t *EvolvingTokenizer) applyBPE(tokens []string) []string {
 }
 
 func (t *EvolvingTokenizer) Encode(s string) []int {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	s = strings.TrimSpace(s)
 	ids := []int{t.Stoi[t.BOS]}
 
@@ -1458,6 +1472,8 @@ func (t *EvolvingTokenizer) Encode(s string) []int {
 }
 
 func (t *EvolvingTokenizer) Decode(ids []int) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	var rawBytes []byte
 	for _, id := range ids {
 		tok := t.Itos[id]
