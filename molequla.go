@@ -3932,6 +3932,7 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 
 	cur := ids[len(ids)-1]
 	var outIDs []int
+	var recentBuf []int // for repetition guard
 	eosID := tok.Stoi[tok.EOS]
 	bosID := tok.Stoi[tok.BOS]
 
@@ -4069,6 +4070,16 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 		ids = append(ids, nxt)
 		cur = nxt
 		outIDs = append(outIDs, nxt)
+
+		// Repetition guard: break if last rg*2 tokens are a repeating pattern
+		recentBuf = append(recentBuf, nxt)
+		rg := CFG.RepetitionGuard
+		if len(recentBuf) > rg*2 {
+			recentBuf = recentBuf[len(recentBuf)-rg*2:]
+			if sliceEqual(recentBuf[rg:], recentBuf[:rg]) {
+				break
+			}
+		}
 
 		if step >= CFG.MinGenTokens && len(outIDs) > 0 {
 			decIDs := append([]int{bosID}, outIDs...)

@@ -492,7 +492,9 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
 
     cur = ids[-1]
     out_ids = []
+    recent_buf = []
     eos_id = tok.stoi.get(tok.EOS, -1)
+    bos_id = tok.stoi.get(tok.BOS, -1)
 
     # Consciousness: per-token dissonance tracking (Feature 1)
     entropy_ema = 0.0
@@ -581,6 +583,20 @@ def _generate_resonant_impl(model, tok, field, prompt_text, model_alpha):
         ids.append(nxt)
         cur = nxt
         out_ids.append(nxt)
+
+        # Repetition guard: break if last rg*2 tokens are a repeating pattern
+        recent_buf.append(nxt)
+        rg = CFG.repetition_guard
+        if len(recent_buf) > rg * 2:
+            recent_buf = recent_buf[-(rg * 2):]
+            if recent_buf[rg:] == recent_buf[:rg]:
+                break
+
+        # Sentence-end check
+        if step >= CFG.min_gen_tokens and out_ids:
+            text = tok.decode([bos_id] + out_ids + [eos_id])
+            if text and text[-1] in '.!?':
+                break
 
         if len(ids) >= model.block_size:
             ids = ids[-model.block_size:]
