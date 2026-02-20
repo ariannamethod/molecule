@@ -120,8 +120,8 @@ impl Default for Config {
             ckpt_path: "molequla_ckpt.json".into(),
             max_corpus_lines: 8000, max_line_chars: 240, min_new_chars_to_train: 480,
             tie_embeddings: true, n_layer: 1, n_embd: 16, n_head: 1, block_size: 96,
-            // embryo: ~19K params, infant: ~47K params, child: ~206K params, adolescent: ~1.3M params, adult: ~10M params
-            growth_stages: vec![[0,16,1,1],[20000,32,1,2],[50000,64,2,4],[200000,128,4,4],[500000,320,6,8]],
+            // embryo: ~10K params, infant: ~28K params, child: ~154K params, adolescent: ~1.1M params, teen: ~4.1M params, adult: ~10M params
+            growth_stages: vec![[0,16,1,1],[20000,32,1,2],[50000,64,2,4],[200000,128,4,4],[350000,224,5,8],[500000,320,6,8]],
             freeze_after_growth_steps: 500, post_growth_lr_scale: 0.3,
             warmup_steps: 1200, micro_steps: 32,
             learning_rate: 0.01, beta1: 0.9, beta2: 0.99, eps_adam: 1e-8, grad_clip: 1.0,
@@ -2728,7 +2728,7 @@ fn background_trainer(
             let mut m = model.lock().unwrap();
             let current_stage = m.current_growth_stage();
             if !docs.is_empty() && current_stage >= 0 && current_stage > m.last_warmup_stage {
-                let stage_names = ["embryo", "infant", "child", "adolescent", "adult"];
+                let stage_names = ["embryo", "infant", "child", "adolescent", "teen", "adult"];
                 let stage_name = stage_names[current_stage as usize % stage_names.len()];
                 let embryo_embd = cfg.growth_stages[0][1];
                 let warmup_scale = (m.n_embd / embryo_embd.max(1)).max(1);
@@ -3085,7 +3085,7 @@ fn main() {
     let target_stage = model.target_growth_stage(corpus_chars);
     let current_stage = model.current_growth_stage();
     if target_stage > current_stage as usize && !docs.is_empty() {
-        let stage_names = ["embryo", "infant", "child", "adolescent", "adult"];
+        let stage_names = ["embryo", "infant", "child", "adolescent", "teen", "adult"];
         eprintln!("[init] Per-stage warmup: current={}, target={}", current_stage, target_stage);
         loop {
             let stage = model.current_growth_stage();

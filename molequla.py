@@ -58,10 +58,11 @@ class Config:
 
     # ontogenesis — growth stages (corpus_chars, n_embd, n_layer, n_head)
     growth_stages: tuple = (
-        (0,      16, 1, 1),      # embryo: ~19K params
-        (20000,  32, 1, 2),      # infant: ~47K params
-        (50000,  64, 2, 4),      # child: ~206K params
-        (200000, 128, 4, 4),     # adolescent: ~1.3M params
+        (0,      16, 1, 1),      # embryo: ~10K params
+        (20000,  32, 1, 2),      # infant: ~28K params
+        (50000,  64, 2, 4),      # child: ~154K params
+        (200000, 128, 4, 4),     # adolescent: ~1.1M params
+        (350000, 224, 5, 8),     # teen: ~4.1M params
         (500000, 320, 6, 8),     # adult: ~10M params
     )
     freeze_after_growth_steps: int = 500  # freeze base weights after growth, train only deltas
@@ -2929,7 +2930,7 @@ async def background_trainer(con, model: GPT, tok: EvolvingTokenizer, swarm=None
         # Per-stage warmup: if current stage > last warmed stage, run warmup
         current_stage = model.current_growth_stage()
         if docs and current_stage >= 0 and current_stage > model.last_warmup_stage:
-            stage_name = ["embryo", "infant", "child", "adolescent", "adult"][min(current_stage, 4)]
+            stage_name = ["embryo", "infant", "child", "adolescent", "teen", "adult"][min(current_stage, 5)]
             embryo_embd = CFG.growth_stages[0][1]
             warmup_scale = max(1, model.n_embd // embryo_embd)
             effective_warmup = CFG.warmup_steps * warmup_scale
@@ -3131,7 +3132,7 @@ async def chat_main():
             print(f"[init] Per-stage warmup: current={current_stage}, target={target_stage}")
             while True:
                 stage = model.current_growth_stage()
-                stage_name = ["embryo", "infant", "child", "adolescent", "adult"][min(stage, 4)]
+                stage_name = ["embryo", "infant", "child", "adolescent", "teen", "adult"][min(stage, 5)]
                 _, embd, layer, head = CFG.growth_stages[min(stage, len(CFG.growth_stages)-1)]
                 print(f"[init] Stage {stage} ({stage_name}): embd={embd}, layer={layer}, head={head}")
                 train_steps(model, tok, docs, CFG.warmup_steps)

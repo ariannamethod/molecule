@@ -46,10 +46,11 @@ const CFG = {
 
     // ontogenesis — growth stages [corpus_chars, n_embd, n_layer, n_head]
     growthStages: [
-        [0,      16, 1, 1],    // embryo: ~19K params
-        [20000,  32, 1, 2],    // infant: ~47K params
-        [50000,  64, 2, 4],    // child: ~206K params
-        [200000, 128, 4, 4],   // adolescent: ~1.3M params
+        [0,      16, 1, 1],    // embryo: ~10K params
+        [20000,  32, 1, 2],    // infant: ~28K params
+        [50000,  64, 2, 4],    // child: ~154K params
+        [200000, 128, 4, 4],   // adolescent: ~1.1M params
+        [350000, 224, 5, 8],   // teen: ~4.1M params
         [500000, 320, 6, 8],   // adult: ~10M params
     ],
     freezeAfterGrowthSteps: 500,

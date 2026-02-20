@@ -28,7 +28,7 @@ THIS IS:
 - Delta adapters (LoRA-style, never forgets)
 - Native gamma: personality fingerprint that grows from zero
 - Byte-level BPE tokenizer (GPT-3/4 style, any UTF-8 input)
-- Ontogenesis: organism grows from 19K embryo to 10M adult (5 stages)
+- Ontogenesis: organism grows from 10K embryo to 10M adult (6 stages)
 - Residual scaling: α = 1/√n_layer on attention + MLP (stable deep networks)
 - Global cosine LR with linear warmup (not per-burst hacks)
 - Gradient accumulation (effective batch scales with model growth)
@@ -63,7 +63,7 @@ What if it could chat? **SQLite memory.**
 What if it had multiple attention mechanisms? **Hybrid heads.**  
 What if it grew a personality from scratch? **Native gamma.**  
 What if it could speak before training? **Corpus field.**  
-What if it started as a 19K embryo and grew to 10M? **Ontogenesis.**  
+What if it started as a 10K embryo and grew to 10M? **Ontogenesis.**  
 What if it could reason about its own learning? **SyntropyTracker.**
 What if it noticed when it was surprised? **Self-prediction error.**
 What if it could break its own patterns? **Anti-field.**
@@ -129,10 +129,10 @@ H: and the lid the bad a data s a built my you?
 it through the fields dating work.
 ```
 
-Yes, it's fragmented. It's a 19K-param embryo that just grew to 47K params in real time.
+Yes, it's fragmented. It's a 10K-param embryo that just grew to 28K params in real time.
 But look closely: "What is the..." patterns, numbers ("six", "hundred", "forty"),
 the word "pattern" emerging, even "H:" as a learned token. It's learning QA structure.
-Feed it more corpus and watch it grow through 5 stages to 10M params.
+Feed it more corpus and watch it grow through 6 stages to 10M params.
 
 ### Browser (molequla.js)
 
@@ -590,10 +590,11 @@ class Config:
 
     # Ontogenesis (growth stages: corpus_chars, n_embd, n_layer, n_head)
     growth_stages: tuple = (
-        (0,      16, 1, 1),            # embryo: ~19K params
-        (20000,  32, 1, 2),            # infant: ~47K params
-        (50000,  64, 2, 4),            # child: ~206K params
-        (200000, 128, 4, 4),           # adolescent: ~1.3M params
+        (0,      16, 1, 1),            # embryo: ~10K params
+        (20000,  32, 1, 2),            # infant: ~28K params
+        (50000,  64, 2, 4),            # child: ~154K params
+        (200000, 128, 4, 4),           # adolescent: ~1.1M params
+        (350000, 224, 5, 8),           # teen: ~4.1M params
         (500000, 320, 6, 8),           # adult: ~10M params
     )
     freeze_after_growth_steps: int = 500
@@ -787,7 +788,7 @@ Because atoms are micrograd. We build molequlas.
 
 1. **Performance varies.** Python has numpy. Go, C, and Rust are natively fast. JS runs in the browser — fast enough for chat, slower for training (no BLAS, Float64Array only). No CUDA anywhere.
 
-2. **It starts small.** Default: embryo (1 layer, 16 dims, 1 head, ~19K params). Ontogenesis grows it through 5 stages to adult (6 layers, 320 dims, 8 heads, ~10M params). When it hits the ceiling, it divides. You're not getting GPT-4 reasoning. You're getting an ecology of organisms that grow and reproduce.
+2. **It starts small.** Default: embryo (1 layer, 16 dims, 1 head, ~10K params). Ontogenesis grows it through 6 stages to adult (6 layers, 320 dims, 8 heads, ~10M params). When it hits the ceiling, it divides. You're not getting GPT-4 reasoning. You're getting an ecology of organisms that grow and reproduce.
 
 3. **It talks weird at first.** The corpus field helps, but it's still a baby organism. Feed it better corpus.
 
@@ -818,13 +819,14 @@ GPT-3/4 style tokenizer replacing char-level + word-based BPE:
 - Full UTF-8 roundtrip: ASCII, Cyrillic, CJK, emoji — same algorithm, same code
 
 ### Phase 3A: Growing Architecture (Ontogenesis) — DONE (all four)
-The organism starts as an embryo and grows through 5 stages:
+The organism starts as an embryo and grows through 6 stages:
 ```
 Stage       Corpus    Dims  Layers  Heads  ~Params
-embryo      0         16    1       1      ~19K
-infant      20KB      32    1       2      ~47K
-child       50KB      64    2       4      ~206K
-adolescent  200KB     128   4       4      ~1.3M
+embryo      0         16    1       1      ~10K
+infant      20KB      32    1       2      ~28K
+child       50KB      64    2       4      ~154K
+adolescent  200KB     128   4       4      ~1.1M
+teen        350KB     224   5       8      ~4.1M
 adult       500KB     320   6       8      ~10M
 ```
 
