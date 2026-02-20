@@ -4758,10 +4758,16 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 			warmupScale := model.NEmbd / embryoEmbd
 			if warmupScale < 1 { warmupScale = 1 }
 			effectiveWarmup := CFG.WarmupSteps * warmupScale
-			fmt.Printf("[trainer] warmup training... %d steps (scaled %dx for embd=%d)\n", effectiveWarmup, warmupScale, model.NEmbd)
-			trainSteps(model, tok, docs, effectiveWarmup, true, true)
-			SaveCheckpoint(model, tok, "")
-			dbLogGrowth(db, model, tok, docs, 0.0, "warmup_complete")
+			remaining := effectiveWarmup - model.globalStep
+			if remaining > 0 {
+				fmt.Printf("[trainer] warmup training... %d steps (scaled %dx for embd=%d, from step %d)\n",
+					remaining, warmupScale, model.NEmbd, model.globalStep)
+				trainSteps(model, tok, docs, remaining, true, true)
+				SaveCheckpoint(model, tok, "")
+				dbLogGrowth(db, model, tok, docs, 0.0, "warmup_complete")
+			} else {
+				fmt.Printf("[trainer] already trained %d steps, skipping warmup.\n", model.globalStep)
+			}
 			warmedUp = true
 			fmt.Println("[trainer] warmup complete. base may freeze now, like a proud fossil.")
 		}
