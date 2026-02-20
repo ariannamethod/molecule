@@ -27,7 +27,7 @@ fn now_secs() -> f64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
     corpus_path: String, db_path: String, ckpt_path: String,
-    max_corpus_lines: usize, max_line_chars: usize, min_new_chars: usize,
+    max_corpus_lines: usize, max_line_chars: usize, min_new_chars_to_train: usize,
     tie_embeddings: bool,
     n_layer: usize, n_embd: usize, n_head: usize, block_size: usize,
     growth_stages: Vec<[usize; 4]>, freeze_after_growth_steps: usize,
@@ -54,7 +54,7 @@ impl Default for Config {
         Config {
             corpus_path: "nonames.txt".into(), db_path: "memory.sqlite3".into(),
             ckpt_path: "molequla_ckpt.json".into(),
-            max_corpus_lines: 8000, max_line_chars: 240, min_new_chars: 480,
+            max_corpus_lines: 8000, max_line_chars: 240, min_new_chars_to_train: 480,
             tie_embeddings: true, n_layer: 1, n_embd: 16, n_head: 1, block_size: 96,
             growth_stages: vec![[0,16,1,1],[20000,32,1,2],[50000,64,2,4],[200000,128,4,4],[500000,256,6,8]],
             freeze_after_growth_steps: 200, warmup_steps: 1200, micro_steps: 32,
@@ -469,7 +469,7 @@ impl Tape {
                     let nf = n as f64;
                     let mut dot_grad = 0.0;
                     for j in 0..n { dot_grad += grad[j] * orig_x[j]; }
-                    let scale = dot_grad / (nf * (ms + 1e-5));
+                    let scale = dot_grad * inv_rms / (nf * (ms + 1e-5));
                     for j in 0..n {
                         self.nodes[a].grad[j] += inv_rms * grad[j] - scale * orig_x[j];
                     }
@@ -636,13 +636,46 @@ struct MergePair { a: String, b: String }
 #[derive(Clone, Serialize, Deserialize)]
 struct EvolvingTokenizer {
     tokens: Vec<String>,
+    #[serde(default)]
     stoi: HashMap<String, usize>,
+    #[serde(default)]
     vocab_size: usize,
-    bos: String, eos: String, pad: String,
-    bos_id: usize, eos_id: usize, pad_id: usize,
+    #[serde(default = "default_bos")]
+    bos: String,
+    #[serde(default = "default_eos")]
+    eos: String,
+    #[serde(default = "default_pad")]
+    pad: String,
+    #[serde(default)]
+    bos_id: usize,
+    #[serde(default)]
+    eos_id: usize,
+    #[serde(default)]
+    pad_id: usize,
     bpe_enabled: bool,
     merges: Vec<MergePair>,
     trained_chars: usize,
+}
+
+fn default_bos() -> String { "<BOS>".to_string() }
+fn default_eos() -> String { "<EOS>".to_string() }
+fn default_pad() -> String { "<PAD>".to_string() }
+
+impl EvolvingTokenizer {
+    /// Rebuild stoi and special token IDs from tokens vec (for cross-impl compat)
+    fn rebuild_indices(&mut self) {
+        self.stoi.clear();
+        for (i, t) in self.tokens.iter().enumerate() {
+            self.stoi.insert(t.clone(), i);
+        }
+        self.vocab_size = self.tokens.len();
+        self.bos_id = *self.stoi.get("<BOS>").unwrap_or(&(self.vocab_size.saturating_sub(3)));
+        self.eos_id = *self.stoi.get("<EOS>").unwrap_or(&(self.vocab_size.saturating_sub(2)));
+        self.pad_id = *self.stoi.get("<PAD>").unwrap_or(&(self.vocab_size.saturating_sub(1)));
+        self.bos = "<BOS>".to_string();
+        self.eos = "<EOS>".to_string();
+        self.pad = "<PAD>".to_string();
+    }
 }
 
 fn unicode_category(c: char) -> u8 {
@@ -1875,12 +1908,19 @@ impl Metabolism {
 // ============================================================
 
 #[derive(Serialize, Deserialize)]
+#[allow(non_snake_case)]
+struct DeltaCkpt {
+    A: Vec<Vec<f64>>,
+    B: Vec<Vec<f64>>,
+}
+
+#[derive(Serialize, Deserialize)]
 struct CheckpointData {
     cfg: Config,
     tokenizer: EvolvingTokenizer,
     base: HashMap<String, Vec<Vec<f64>>>,
     alpha: Vec<f64>,
-    deltas: Vec<HashMap<String, (Vec<Vec<f64>>, Vec<Vec<f64>>)>>, // name -> (A_data, B_data)
+    deltas: Vec<HashMap<String, DeltaCkpt>>, // name -> {A, B} — Go-compatible
     init_embed_snapshot: Vec<Vec<f64>>,
     global_step: usize,
 }
@@ -1894,7 +1934,7 @@ fn save_checkpoint(model: &GPT, path: &str) -> std::io::Result<()> {
     for dm in &model.deltas {
         let mut dm_data = HashMap::new();
         for (name, adapter) in dm {
-            dm_data.insert(name.clone(), (adapter.a.data.clone(), adapter.b.data.clone()));
+            dm_data.insert(name.clone(), DeltaCkpt { A: adapter.a.data.clone(), B: adapter.b.data.clone() });
         }
         deltas_data.push(dm_data);
     }
@@ -1911,7 +1951,11 @@ fn save_checkpoint(model: &GPT, path: &str) -> std::io::Result<()> {
 fn load_checkpoint(path: &str) -> Result<GPT, Box<dyn std::error::Error>> {
     let json = fs::read_to_string(path)?;
     let ckpt: CheckpointData = serde_json::from_str(&json)?;
-    let tok = ckpt.tokenizer;
+    let mut tok = ckpt.tokenizer;
+    // Rebuild stoi/indices if loaded from Go/C/Python checkpoint
+    if tok.stoi.is_empty() && !tok.tokens.is_empty() {
+        tok.rebuild_indices();
+    }
     let cfg = ckpt.cfg;
     let ne = cfg.n_embd;
     let mut gpt = GPT::new(tok.clone(), &cfg);
@@ -1929,7 +1973,8 @@ fn load_checkpoint(path: &str) -> Result<GPT, Box<dyn std::error::Error>> {
     gpt.active_alpha = ckpt.alpha;
     for dm_data in &ckpt.deltas {
         let mut dm = DeltaModule::new();
-        for (name, (a_data, b_data)) in dm_data {
+        for (name, dc) in dm_data {
+            let a_data = &dc.A; let b_data = &dc.B;
             let mut a = MatrixParam { data: a_data.clone(), grad: vec![vec![0.0; a_data[0].len()]; a_data.len()], nout: a_data.len(), nin: a_data[0].len() };
             let mut b = MatrixParam { data: b_data.clone(), grad: vec![vec![0.0; b_data[0].len()]; b_data.len()], nout: b_data.len(), nin: b_data[0].len() };
             a.ensure_grad(); b.ensure_grad();

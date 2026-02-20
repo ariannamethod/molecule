@@ -278,7 +278,7 @@ static void ia_free(IntArr *a) {
  * 1) ARENA ALLOCATOR — for autograd graphs
  * ============================================================ */
 
-#define ARENA_SIZE (64 * 1024 * 1024) /* 64 MB */
+#define ARENA_SIZE (256 * 1024 * 1024) /* 256 MB */
 
 typedef struct {
     char *buf;
@@ -730,15 +730,15 @@ static Node *scalar_addf(Node *a, double f) {
 /* --- Backward (topological sort) --- */
 /* And lo, the graph shall be walked backwards, like a salmon with regrets. */
 
-#define MAX_TOPO 65536
+#define MAX_TOPO 262144
 
 static void backward(Node *root) {
-    Node *topo[MAX_TOPO];
+    /* Heap-allocated to avoid stack overflow in threads */
+    Node **topo = (Node **)malloc(MAX_TOPO * sizeof(Node *));
+    Node **stack = (Node **)malloc(MAX_TOPO * sizeof(Node *));
     int topo_len = 0;
-
-    /* Iterative DFS for topo sort */
-    Node *stack[MAX_TOPO];
     int stack_len = 0;
+
     stack[stack_len++] = root;
 
     while (stack_len > 0) {
@@ -747,14 +747,15 @@ static void backward(Node *root) {
             stack_len--;
             if (n->visited != 2) {
                 n->visited = 2;
-                topo[topo_len++] = n;
+                if (topo_len < MAX_TOPO) topo[topo_len++] = n;
             }
             continue;
         }
         n->visited = 1;
         for (int i = 0; i < n->n_children; i++) {
-            if (n->children[i] && n->children[i]->visited == 0)
-                stack[stack_len++] = n->children[i];
+            if (n->children[i] && n->children[i]->visited == 0) {
+                if (stack_len < MAX_TOPO) stack[stack_len++] = n->children[i];
+            }
         }
     }
 
@@ -763,6 +764,8 @@ static void backward(Node *root) {
         if (topo[i]->backward)
             topo[i]->backward(topo[i]);
     }
+    free(topo);
+    free(stack);
 }
 
 /* ============================================================
@@ -1747,7 +1750,34 @@ static AdamState *adam_new(int nout, int nin) {
     return s;
 }
 
+/* Grow Adam state to match expanded MatrixParam (ontogenesis/vocab growth) */
+static void adam_grow(AdamState *st, int new_nout, int new_nin) {
+    if (new_nout > st->nout) {
+        st->m = realloc(st->m, new_nout * sizeof(double*));
+        st->v = realloc(st->v, new_nout * sizeof(double*));
+        for (int i = st->nout; i < new_nout; i++) {
+            st->m[i] = calloc(new_nin, sizeof(double));
+            st->v[i] = calloc(new_nin, sizeof(double));
+        }
+    }
+    if (new_nin > st->nin) {
+        for (int i = 0; i < st->nout; i++) {
+            st->m[i] = realloc(st->m[i], new_nin * sizeof(double));
+            st->v[i] = realloc(st->v[i], new_nin * sizeof(double));
+            for (int j = st->nin; j < new_nin; j++) {
+                st->m[i][j] = 0.0;
+                st->v[i][j] = 0.0;
+            }
+        }
+    }
+    st->nout = new_nout;
+    st->nin = new_nin;
+}
+
 static void adam_step(AdamState *st, MatrixParam *mat, double lr) {
+    /* Auto-grow if matrix was expanded (vocab growth, ontogenesis) */
+    if (mat->nout > st->nout || mat->nin > st->nin)
+        adam_grow(st, mat->nout, mat->nin);
     st->t++;
     double b1c = 1.0 - pow(CFG.beta1, st->t);
     double b2c = 1.0 - pow(CFG.beta2, st->t);
