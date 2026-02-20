@@ -168,7 +168,7 @@ It's both organism *and* field observer — the grey cardinal of the swarm.
 
 ```
 ╔══════════════════════════════════════════════════╗
-║  MOLEQULA.RS — The Fifth Element                ║
+║  MOLEQULA.RS — The Fifth Element                 ║
 ║  GPT organism + distributed cognition metabolism ║
 ╚══════════════════════════════════════════════════╝
 [init] Corpus: 384 lines, 25064 chars
