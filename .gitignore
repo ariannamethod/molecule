@@ -78,3 +78,9 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 _codeql_detected_source_root
+molequla_bin
+molequla_c
+molequla_go
+molequla_new
+*.o
+*.dylib
