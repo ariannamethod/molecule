@@ -1,7 +1,11 @@
 #!/bin/bash
 # test_all.sh — integration tests for all molequla elements + mycelium
-# run from ~/molequla on Lambda
+# Can be run from anywhere: auto-detects repo root.
 set -euo pipefail
+
+# cd to repo root (one level up from tests/)
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
 
 export PATH=$PATH:/usr/local/go/bin:$HOME/.cargo/bin
 
