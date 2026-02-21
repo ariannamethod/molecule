@@ -147,10 +147,6 @@ const CFG = {
     antiFieldProb: 0.05,
     antiFieldMinStep: 8,
 
-    // consciousness: overthinkg rings
-    overthinkcRounds: 2,
-    overthinkcMaxTokens: 32,
-
     // consciousness: conscience (self-editing)
     conscienceWindow: 8,
     conscienceDecay: 0.95,
@@ -2797,70 +2793,6 @@ class GPT {
     }
 }
 
-// OverthinkcRings: after generating a response, "re-read" own output to enrich CooccurField.
-// This is internal monologue — the model strengthens connections from its own speech.
-// "I said this. What patterns emerge? Let me think about what I just said."
-function overthinkcRings(model, tok, field, text, rounds, _snapEmbd) {
-    if (!field || rounds <= 0) return;
-    const ids = tok.encode(text);
-    if (ids.length < 3) return;
-
-    // Snapshot embedding dimension for ontogenesis race guard
-    const snapEmbd = _snapEmbd || model.nEmbd;
-
-    // First: ingest the original output into the field
-    field.ingestTokens(ids);
-
-    // Then: generate hidden continuations and ingest those too
-    const savedGrad = _gradEnabled;
-    _gradEnabled = false;
-    try {
-        for (let r = 0; r < rounds; r++) {
-            // Ontogenesis guard: if model dimensions changed mid-loop, bail out
-            if (model.nEmbd !== snapEmbd) {
-                logUI(`[overthinkcRings] ontogenesis detected mid-loop (snap=${snapEmbd}, now=${model.nEmbd}), aborting round ${r}`);
-                break;
-            }
-
-            // Take last 3 tokens as seed
-            let seed = ids;
-            if (seed.length > 3) seed = seed.slice(-3);
-
-            const keys = []; const values = [];
-            for (let li = 0; li < model.nLayer; li++) { keys.push([]); values.push([]); }
-            for (let p = 0; p < seed.length; p++) {
-                model.forwardStep(seed[p], p, keys, values);
-            }
-
-            let cur = seed[seed.length - 1];
-            const phantomIds = [];
-            const eosId = tok.stoi.get(tok.EOS);
-            for (let t = 0; t < CFG.overthinkcMaxTokens; t++) {
-                // Inner ontogenesis check: dimension mismatch mid-generation
-                if (model.nEmbd !== snapEmbd) {
-                    logUI(`[overthinkcRings] ontogenesis mid-token at t=${t}, aborting`);
-                    break;
-                }
-                let pos = seed.length + t - 1;
-                if (pos > model.blockSize - 1) pos = model.blockSize - 1;
-                const logits = model.forwardStep(cur, pos, keys, values);
-                const probs = softmaxProbsFloat(logits.data instanceof Float64Array
-                    ? Array.from(logits.data) : logits.data);
-                const nxt = topKTopPSample(probs, CFG.topK, CFG.topP, CFG.minP, CFG.typicalP);
-                if (nxt === eosId) break;
-                phantomIds.push(nxt);
-                cur = nxt;
-            }
-
-            if (phantomIds.length > 0) {
-                field.ingestTokens(phantomIds);
-            }
-        }
-    } finally {
-        _gradEnabled = savedGrad;
-    }
-}
-
 // ============================================================
 // 8) CHECKPOINTING — JSON to IndexedDB, because we refuse dependencies
 // ============================================================
@@ -3712,25 +3644,6 @@ async function handleUserMessage(text) {
         }
     }
 
-    // Consciousness: overthinkg rings (Feature 3)
-    // "Let me re-read what I just said to strengthen my patterns."
-    // Only activate at final growth stage — during ontogenesis, dimension changes
-    // between growth and overthinkcRings cause crashes. At final stage, no more
-    // growth is possible so the race condition is eliminated.
-    const finalStageJS = CFG.growthStages.length - 1;
-    if (CFG.overthinkcRounds > 0 && answer.length > 3 && _field
-        && _model.currentGrowthStage() >= finalStageJS) {
-        const snapEmbd = _model.nEmbd;
-        try {
-            if (_model.nEmbd === snapEmbd) {
-                overthinkcRings(_model, _tok, _field, answer, CFG.overthinkcRounds, snapEmbd);
-            }
-        } catch (e) {
-            // Dimension mismatch from ontogenesis — silently skip
-            logUI(`[overthinkcRings] skipped: dimension mismatch (snap=${snapEmbd}, now=${_model.nEmbd}): ${e.message}`);
-        }
-    }
-
     // Feed corpus
     await updateReservoirCorpus();
 }
@@ -4036,7 +3949,7 @@ if (typeof module !== "undefined" && module.exports) {
         backward, withNoGrad, MatrixParam, EvolvingTokenizer, GPT,
         extractCandidateSentences, reservoirMixKeep, normalizeText, rng,
         headTypesForNHead, DeltaAdapter, SyntropyTracker, SwarmRegistry,
-        CooccurField, overthinkcRings,
+        CooccurField,
     };
 }
 

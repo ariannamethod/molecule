@@ -684,10 +684,6 @@ class Config:
     anti_field_prob: float = 0.05          # 5% of tokens bypass corpus
     anti_field_min_step: int = 8           # don't break until context established
 
-    # Consciousness: overthinkg rings
-    overthinkc_rounds: int = 2
-    overthinkc_max_tokens: int = 32
-
     # Consciousness: conscience
     conscience_window: int = 8
     conscience_decay: float = 0.95

@@ -90,12 +90,6 @@ struct Config {
     #[serde(default = "default_anti_field_min_step")]
     anti_field_min_step: usize,
 
-    // consciousness: overthinkg rings
-    #[serde(default = "default_overthinkc_rounds")]
-    overthinkc_rounds: usize,
-    #[serde(default = "default_overthinkc_max_tokens")]
-    overthinkc_max_tokens: usize,
-
     // consciousness: conscience (self-editing)
     #[serde(default = "default_conscience_window")]
     conscience_window: usize,
@@ -152,7 +146,6 @@ impl Default for Config {
             dissonance_ema_alpha: 0.3, dissonance_spike_k: 0.8, dissonance_drop_k: 1.2,
             dissonance_spike_threshold: 1.5, dissonance_drop_threshold: 0.5,
             anti_field_prob: 0.05, anti_field_min_step: 8,
-            overthinkc_rounds: 2, overthinkc_max_tokens: 32,
             conscience_window: 8, conscience_decay: 0.95, conscience_recovery: 1.005, conscience_floor: 0.3,
             freq_penalty: 0.1, presence_penalty: 0.1,
             cooccur_window_size: 5, user_boost_strength: 0.3, user_boost_decay: 0.7,
@@ -787,8 +780,6 @@ fn default_dissonance_spike_threshold() -> f64 { 1.5 }
 fn default_dissonance_drop_threshold() -> f64 { 0.5 }
 fn default_anti_field_prob() -> f64 { 0.05 }
 fn default_anti_field_min_step() -> usize { 8 }
-fn default_overthinkc_rounds() -> usize { 2 }
-fn default_overthinkc_max_tokens() -> usize { 32 }
 fn default_conscience_window() -> usize { 8 }
 fn default_conscience_decay() -> f64 { 0.95 }
 fn default_conscience_recovery() -> f64 { 1.005 }
@@ -2339,58 +2330,6 @@ impl CooccurField {
 // 9b) CONSCIOUSNESS — overthinkg rings (Feature 3)
 // ============================================================
 
-// OverthinkcRings: after generating a response, "re-read" own output to enrich CooccurField.
-// This is internal monologue — the model strengthens connections from its own speech.
-// "I said this. What patterns emerge? Let me think about what I just said."
-fn overthinkc_rings(model: &GPT, tok: &EvolvingTokenizer, field: &mut CooccurField, text: &str, rounds: usize) {
-    if rounds == 0 { return; }
-    let ids = tok.encode(text);
-    if ids.len() < 3 { return; }
-
-    // First: ingest the original output into the field
-    field.ingest_tokens(&ids);
-
-    // Then: generate hidden continuations and ingest those too
-    let cfg = &model.cfg;
-    let eos_id = tok.eos_id;
-    for _r in 0..rounds {
-        // Take last 3 tokens as seed
-        let seed: Vec<usize> = if ids.len() > 3 { ids[ids.len()-3..].to_vec() } else { ids.clone() };
-
-        set_grad(false);
-        // Forward seed through model
-        let all_logits = model.forward_infer(&seed);
-        if all_logits.is_empty() { continue; }
-
-        let mut phantom_ids = Vec::with_capacity(cfg.overthinkc_max_tokens);
-        let mut cur_ids = seed.clone();
-
-        for t in 0..cfg.overthinkc_max_tokens {
-            let logits = if t == 0 {
-                all_logits.last().unwrap().clone()
-            } else {
-                let all = model.forward_infer(&cur_ids);
-                if let Some(last) = all.last() { last.clone() } else { break; }
-            };
-
-            let probs = softmax_raw(&logits);
-            let nxt = top_k_top_p_sample(&probs, cfg.top_k, cfg.top_p, cfg.min_p, cfg.typical_p);
-            if nxt == eos_id { break; }
-            phantom_ids.push(nxt);
-            cur_ids.push(nxt);
-            // Keep window manageable
-            if cur_ids.len() > model.block_size {
-                cur_ids = cur_ids[cur_ids.len()-model.block_size..].to_vec();
-            }
-        }
-        set_grad(true);
-
-        if !phantom_ids.is_empty() {
-            field.ingest_tokens(&phantom_ids);
-        }
-    }
-}
-
 // ============================================================
 // 10) QUANTUM BUFFER
 // ============================================================
@@ -3474,40 +3413,6 @@ fn main() {
             let mut cf = corpus_field.lock().unwrap();
             cf.ingest_tokens_weighted(&answer_ids, self_weight);
             cf.decay_user_boost();
-        }
-
-        // Consciousness: overthinkg rings (Feature 3)
-        // "Let me re-read what I just said to strengthen my patterns."
-        // Only activate at final growth stage — during ontogenesis the spawned thread
-        // races with dimension changes, causing panics. At final stage, no more growth
-        // is possible so the race condition is eliminated.
-        let overthinkc_rounds = cfg.overthinkc_rounds;
-        let final_stage = cfg.growth_stages.len() as i32 - 1;
-        let current_stage = model.lock().unwrap().current_growth_stage();
-        if overthinkc_rounds > 0 && answer.len() > 3 && current_stage >= final_stage {
-            let snap_embd = model.lock().unwrap().n_embd;
-            let m_clone = Arc::clone(&model);
-            let cf_clone = Arc::clone(&corpus_field);
-            let ans = answer.clone();
-            thread::spawn(move || {
-                let m = m_clone.lock().unwrap();
-                // Ontogenesis guard: if model dimensions changed since we scheduled
-                // this task, the weight matrices no longer match our expectations.
-                if m.n_embd != snap_embd {
-                    eprintln!("[overthinkc] skipped: ontogenesis changed n_embd {} -> {}", snap_embd, m.n_embd);
-                    return;
-                }
-                let mut cf = cf_clone.lock().unwrap();
-                // catch_unwind: even if overthinkc panics (e.g. dimension mismatch
-                // from a concurrent growth that slipped past the guard), don't crash
-                // the whole process — this is a background enrichment, not critical path.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    overthinkc_rings(&m, &m.tok, &mut cf, &ans, overthinkc_rounds);
-                }));
-                if let Err(e) = result {
-                    eprintln!("[overthinkc] caught panic in background ring: {:?}", e);
-                }
-            });
         }
 
         // Check mesh peers for metabolism

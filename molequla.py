@@ -157,10 +157,6 @@ class Config:
     anti_field_prob: float = 0.05      # probability of pure-model token (bypass corpus)
     anti_field_min_step: int = 8       # don't anti-field before this many tokens
 
-    # consciousness: overthinkg rings
-    overthinkc_rounds: int = 2         # hidden re-generation rounds after response
-    overthinkc_max_tokens: int = 32    # max tokens per overthinkg round
-
     # consciousness: conscience (self-editing)
     conscience_window: int = 8         # rolling window for generation entropy trend
     conscience_decay: float = 0.95     # delta_alpha_scale reduction factor
@@ -2455,50 +2451,6 @@ class GPT:
         return total_ce / count
 
 
-def overthinkc_rings(model, tok, field, text, rounds):
-    """After generating a response, 're-read' own output to enrich CooccurField.
-    Internal monologue — the model strengthens connections from its own speech.
-    'I said this. What patterns emerge? Let me think about what I just said.'"""
-    if field is None or rounds <= 0:
-        return
-    ids = tok.encode(text)
-    if len(ids) < 3:
-        return
-
-    # First: ingest the original output into the field
-    field.ingest_tokens(ids)
-
-    # Then: generate hidden continuations and ingest those too
-    for _ in range(rounds):
-        # Take last 3 tokens as seed
-        seed = ids[-3:] if len(ids) > 3 else ids
-
-        # Quick generation without grad (caller should hold lock or run async)
-        with no_grad():
-            keys = [[] for _ in range(model.n_layer)]
-            values = [[] for _ in range(model.n_layer)]
-            for p in range(len(seed)):
-                model.forward_step(seed[p], p, keys, values)
-
-            cur = seed[-1]
-            phantom_ids = []
-            eos_id = tok.stoi[tok.EOS]
-            for t in range(CFG.overthinkc_max_tokens):
-                pos = len(seed) + t - 1
-                if pos > model.block_size - 1:
-                    pos = model.block_size - 1
-                logits = model.forward_step(cur, pos, keys, values)
-                probs = softmax_probs_float(logits.data.tolist())
-                nxt = top_k_top_p_sample(probs, CFG.top_k, CFG.top_p, CFG.min_p, CFG.typical_p)
-                if nxt == eos_id:
-                    break
-                phantom_ids.append(nxt)
-                cur = nxt
-
-        if phantom_ids:
-            field.ingest_tokens(phantom_ids)
-
-
 # ============================================================
 # 8) CHECKPOINTING — modular, compatible, no merge-amnesia
 # ============================================================
@@ -3412,30 +3364,6 @@ async def chat_main():
                     self_weight = max(0.3, min(2.0, self_weight))
                 model._corpus_field.ingest_tokens_weighted(tok.encode(answer), self_weight)
                 model._corpus_field.decay_user_boost()
-
-            # Consciousness: overthinkg rings (Feature 3)
-            # "Let me re-read what I just said to strengthen my patterns."
-            # Only activate at final growth stage — during ontogenesis the background
-            # thread races with dimension changes, causing crashes. At final stage,
-            # no more growth is possible so the race condition is eliminated.
-            final_stage = len(CFG.growth_stages) - 1
-            if (CFG.overthinkc_rounds > 0 and len(answer) > 3
-                    and model._corpus_field is not None
-                    and model.current_growth_stage() >= final_stage):
-                snap_embd = model.n_embd  # snapshot before thread launch
-                def _overthink(text, mdl, tkn, fld, rounds, snap_n_embd):
-                    try:
-                        with mdl.lock:
-                            if mdl.n_embd != snap_n_embd:
-                                return  # ontogenesis happened, dimensions changed — skip
-                            overthinkc_rings(mdl, tkn, fld, text, rounds)
-                    except (RuntimeError, ValueError, IndexError):
-                        pass  # dimension mismatch from concurrent ontogenesis
-                t = threading.Thread(target=_overthink,
-                                     args=(answer, model, tok, model._corpus_field,
-                                           CFG.overthinkc_rounds, snap_embd),
-                                     daemon=True)
-                t.start()
 
     except KeyboardInterrupt:
         pass
