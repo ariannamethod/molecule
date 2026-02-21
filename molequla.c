@@ -350,7 +350,7 @@ static void ia_free(IntArr *a) {
  * 1) ARENA ALLOCATOR — for autograd graphs
  * ============================================================ */
 
-#define ARENA_SIZE (256 * 1024 * 1024) /* 256 MB */
+#define ARENA_SIZE (512 * 1024 * 1024) /* 512 MB — child stage (embd=64) needs >256 MB */
 
 typedef struct {
     char *buf;
