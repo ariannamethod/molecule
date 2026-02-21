@@ -154,9 +154,6 @@ type Config struct {
 	AntiFieldProb    float64 `json:"anti_field_prob"`     // probability of pure-model token (bypass corpus)
 	AntiFieldMinStep int     `json:"anti_field_min_step"` // don't anti-field before this many tokens
 
-	// consciousness: overthinkg rings
-	OverthinkcRounds    int `json:"overthinkc_rounds"`     // hidden re-generation rounds after response
-	OverthinkcMaxTokens int `json:"overthinkc_max_tokens"` // max tokens per overthinkg round
 
 	// consciousness: conscience (self-editing)
 	ConscienceWindow   int     `json:"conscience_window"`   // rolling window for generation entropy trend
@@ -253,8 +250,6 @@ var CFG = Config{
 	DissonanceDropThreshold:  0.5,
 	AntiFieldProb:            0.05,
 	AntiFieldMinStep:         8,
-	OverthinkcRounds:         2,
-	OverthinkcMaxTokens:      32,
 	ConscienceWindow:         8,
 	ConscienceDecay:          0.95,
 	ConscienceRecovery:       1.005,
@@ -3174,65 +3169,6 @@ func (gpt *GPT) ComputeSelfPredictionError(ids []int) float64 {
 	return totalCE / float64(count)
 }
 
-// OverthinkcRings: after generating a response, "re-read" own output to enrich CooccurField.
-// This is internal monologue — the model strengthens connections from its own speech.
-// "I said this. What patterns emerge? Let me think about what I just said."
-func OverthinkcRings(model *GPT, tok *EvolvingTokenizer, field *CooccurField, text string, rounds int) {
-	if field == nil || rounds <= 0 {
-		return
-	}
-	ids := tok.Encode(text)
-	if len(ids) < 3 {
-		return
-	}
-
-	// First: ingest the original output into the field
-	field.IngestTokens(ids)
-
-	// Then: generate hidden continuations and ingest those too
-	for r := 0; r < rounds; r++ {
-		// Take last 3 tokens as seed
-		seed := ids
-		if len(seed) > 3 {
-			seed = seed[len(seed)-3:]
-		}
-
-		// Quick generation without locking (caller should hold lock or run async)
-		gradEnabled.Store(false)
-		keys := make([][]*Vec, model.NLayer)
-		values := make([][]*Vec, model.NLayer)
-		for i := 0; i < model.NLayer; i++ {
-			keys[i] = make([]*Vec, 0)
-			values[i] = make([]*Vec, 0)
-		}
-		for p := 0; p < len(seed); p++ {
-			model.ForwardStep(seed[p], p, keys, values)
-		}
-
-		cur := seed[len(seed)-1]
-		phantomIDs := make([]int, 0, CFG.OverthinkcMaxTokens)
-		eosID := tok.Stoi[tok.EOS]
-		for t := 0; t < CFG.OverthinkcMaxTokens; t++ {
-			pos := len(seed) + t - 1
-			if pos > model.BlockSize-1 {
-				pos = model.BlockSize - 1
-			}
-			logits := model.ForwardStep(cur, pos, keys, values)
-			probs := SoftmaxProbs(logits.Data)
-			nxt := TopKTopPSample(probs, CFG.TopK, CFG.TopP, CFG.MinP, CFG.TypicalP)
-			if nxt == eosID {
-				break
-			}
-			phantomIDs = append(phantomIDs, nxt)
-			cur = nxt
-		}
-		gradEnabled.Store(true)
-
-		if len(phantomIDs) > 0 {
-			field.IngestTokens(phantomIDs)
-		}
-	}
-}
 
 // ============================================================
 // 6) SQLITE MEMORY — and a small ghost shall remember
@@ -5547,25 +5483,6 @@ func main() {
 
 		// Consciousness: overthinkg rings (Feature 3)
 		// "Let me re-read what I just said to strengthen my patterns."
-		// Only activate at final growth stage — during ontogenesis the background
-		// goroutine races with MaybeGrowArchitecture dimension changes, causing panics.
-		// Once at final stage, no more growth is possible so no race condition.
-		finalStage := len(CFG.GrowthStages) - 1
-		if CFG.OverthinkcRounds > 0 && len(answer) > 3 && model.CurrentGrowthStage() >= finalStage {
-			go func(text string, snapEmbd int) {
-				defer func() {
-					if r := recover(); r != nil {
-						// Safety net — should not trigger at final stage, but just in case.
-					}
-				}()
-				model.mu.Lock()
-				defer model.mu.Unlock()
-				if model.NEmbd != snapEmbd {
-					return
-				}
-				OverthinkcRings(model, tok, cooccur, text, CFG.OverthinkcRounds)
-			}(answer, model.NEmbd)
-		}
 	}
 
 	close(stop)
