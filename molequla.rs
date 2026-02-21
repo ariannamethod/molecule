@@ -1039,6 +1039,12 @@ struct GPT {
     last_surprise: f64,                   // self-prediction error on last prompt
     surprise_baseline: f64,               // EMA of surprise over time
     last_gen_entropy: f64,                // mean entropy of last generation (for conscience)
+
+    // mycelium field steering (read from mesh.db by topology monitor)
+    field_action: String,                 // "sustain", "amplify", "dampen", "ground", "explore", "realign"
+    field_strength: f64,                  // 0..1 intensity
+    field_entropy: f64,                   // system-level entropy from METHOD
+    field_coherence: f64,                 // pairwise gamma cosine from METHOD
 }
 
 impl GPT {
@@ -1088,6 +1094,8 @@ impl GPT {
             init_embed_snapshot: snapshot,
             residual_alpha: 1.0 / (nl as f64).sqrt().max(1.0),
             global_step: 0, syntropy_temp_offset: 0.0,
+            field_action: "wait".into(), field_strength: 0.0,
+            field_entropy: 0.0, field_coherence: 1.0,
             growth_freeze_remaining: 0, last_warmup_stage: -1, growth_step_offset: 0,
             head_types: htypes,
             delta_alpha_scale: 1.0,
@@ -1874,6 +1882,37 @@ impl GPT {
             let final_mul = t_mul * dissonance_mul;
             if (final_mul - 1.0).abs() > 0.001 {
                 let temp = base_temp * final_mul;
+                probs = softmax_raw(&logits.iter().map(|&v| v / temp).collect::<Vec<_>>());
+            }
+
+            // Mycelium field steering: modify temperature based on METHOD action
+            // This is how the orchestrator speaks through the mouth
+            let field_mul = match self.field_action.as_str() {
+                "dampen" => {
+                    // Entropy rising — cool down, be more conservative
+                    1.0 - 0.3 * self.field_strength
+                },
+                "amplify" => {
+                    // Entropy falling — field is organizing, amplify signal
+                    1.0 + 0.2 * self.field_strength
+                },
+                "ground" => {
+                    // High entropy — ground hard, be very focused
+                    1.0 - 0.5 * self.field_strength
+                },
+                "explore" => {
+                    // Low entropy — too rigid, increase temperature to explore
+                    1.0 + 0.4 * self.field_strength
+                },
+                "realign" => {
+                    // Coherence broken — slight cooling to stabilize
+                    1.0 - 0.2 * self.field_strength
+                },
+                _ => 1.0, // sustain, wait — no modulation
+            };
+
+            if (field_mul - 1.0).abs() > 0.001 {
+                let temp = base_temp * final_mul * field_mul;
                 probs = softmax_raw(&logits.iter().map(|&v| v / temp).collect::<Vec<_>>());
             }
 
@@ -3217,6 +3256,30 @@ fn topology_monitor_thread(
         if topo.organisms.len() > 1 {
             eprintln!("[topology] {} organisms, coherence={:.4}, self_drift={:.4}",
                 topo.organisms.len(), topo.field_coherence, drift_rate);
+        }
+
+        // Read mycelium field_steering from mesh.db
+        if let Ok(mut stmt) = db.prepare(
+            "SELECT action, strength, entropy, coherence FROM field_steering WHERE id=1 AND updated_at > ?1"
+        ) {
+            let cutoff = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64() - 120.0;
+            if let Ok(mut rows) = stmt.query(params![cutoff]) {
+                if let Ok(Some(row)) = rows.next() {
+                    let action: String = row.get(0).unwrap_or_default();
+                    let strength: f64 = row.get(1).unwrap_or(0.0);
+                    let entropy: f64 = row.get(2).unwrap_or(0.0);
+                    let coherence: f64 = row.get(3).unwrap_or(1.0);
+                    if let Ok(mut m) = model.lock() {
+                        m.field_action = action.clone();
+                        m.field_strength = strength;
+                        m.field_entropy = entropy;
+                        m.field_coherence = coherence;
+                    }
+                    eprintln!("[mycelium] steering: action={}, strength={:.2}, H={:.3}, C={:.3}",
+                        action, strength, entropy, coherence);
+                }
+            }
         }
     }
 }

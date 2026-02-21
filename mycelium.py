@@ -241,8 +241,9 @@ class Mycelium:
         self._last_steering = None
 
     def step(self):
-        """one tick: read field -> METHOD -> monitor -> report."""
+        """one tick: read field -> METHOD -> monitor -> write steering -> report."""
         steering = self.method.step(dt=self.interval)
+        self.method.write_steering(steering)
         self.monitor.record(steering)
         self._step_count += 1
         self._last_steering = steering
@@ -387,6 +388,7 @@ class Mycelium:
                     self.method.read_field()
                     if self.method.organisms:
                         steering = self.method.step(dt=self.interval)
+                        self.method.write_steering(steering)
                         self.monitor.record(steering)
                         self._last_steering = steering
                         self._step_count += 1

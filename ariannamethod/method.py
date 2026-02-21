@@ -197,6 +197,20 @@ class Method:
             con = sqlite3.connect(self.mesh_path)
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("""
+                CREATE TABLE IF NOT EXISTS field_steering (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    action TEXT,
+                    strength REAL,
+                    target_id TEXT,
+                    entropy REAL,
+                    syntropy REAL,
+                    coherence REAL,
+                    trend REAL,
+                    n_organisms INTEGER,
+                    updated_at REAL
+                )
+            """)
+            con.execute("""
                 CREATE TABLE IF NOT EXISTS field_deltas (
                     layer TEXT PRIMARY KEY,
                     A BLOB,
@@ -388,6 +402,32 @@ class Method:
             con.close()
         except Exception as e:
             print(f"[method] write_deltas error: {e}")
+
+    def write_steering(self, steering):
+        """write steering decision to mesh.db for Rust to read."""
+        try:
+            con = sqlite3.connect(self.mesh_path)
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("""
+                INSERT OR REPLACE INTO field_steering
+                (id, action, strength, target_id, entropy, syntropy,
+                 coherence, trend, n_organisms, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                steering.get("action", "wait"),
+                steering.get("strength", 0.0),
+                str(steering.get("target", "")),
+                steering.get("entropy", 0.0),
+                steering.get("syntropy", 0.0),
+                steering.get("coherence", 0.0),
+                steering.get("trend", 0.0),
+                steering.get("n_organisms", 0),
+                time.time(),
+            ))
+            con.commit()
+            con.close()
+        except Exception as e:
+            print(f"[method] write_steering error: {e}")
 
     def step(self, dt=1.0):
         """
