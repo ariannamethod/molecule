@@ -84,3 +84,6 @@ molequla_go
 molequla_new
 *.o
 *.dylib
+ariannamethod/*.o
+ariannamethod/*.so
+ariannamethod/*.dylib
