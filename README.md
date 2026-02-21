@@ -17,9 +17,9 @@
 
 ```
 THIS IS:
-- Five implementations: Python, Go, C, JavaScript, Rust — same architecture
+- Four elements: Go, C, JavaScript, Rust — connected by mycelium orchestrator
 - Rust is the Fourth Element — the mouth: full organism + distributed cognition metabolism
-- One dependency in Python (numpy), one in Go/Rust (SQLite) — zero in C and JS
+- One dependency in Go/Rust (SQLite), one in mycelium (numpy) — zero in C and JS
 - Runs in the browser: molequla.js, zero npm, zero webpack, one <script> tag
 - Custom autograd engine (vectors, not scalar confetti)
 - RoPE position encoding (GPT-3/4 inspired)
@@ -84,12 +84,24 @@ So meet **molequla**. Inspired by Karpathy's micrograd, but this is not a fork.
 ## Quick Start
 
 ```bash
-# You need: Python 3.7+ and numpy
-pip install numpy
-python molequla.py
+# Go (recommended)
+go build -o molequla_bin molequla.go && ./molequla_bin
+
+# Rust (the mouth — steered by mycelium)
+cargo run --release
+
+# C (94KB binary, zero dependencies)
+gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm && ./molequla
+
+# JavaScript (browser — one <script> tag)
+python3 -m http.server 8000
+# Open http://localhost:8000/index.html
+
+# Mycelium (orchestrator — reads the field, steers Rust)
+python3 mycelium.py
 ```
 
-That's it. It will:
+Each element will:
 1. Load `nonames.txt` (seed corpus — the organism's first breath)
 2. Create `memory.sqlite3` (conversation memory)
 3. Respond immediately using corpus statistics (before any training)
@@ -161,8 +173,8 @@ Same JS organism, runs outside the browser with file-based checkpoints. Warmup t
 cargo run --release
 ```
 
-Same organism as the other four, plus three Rust-only features:
-- **Distributed cognition metabolism**: a 5→8→5 Hebbian MLP that coordinates all running instances
+Same organism as the other three, plus Rust-only features:
+- **Distributed cognition metabolism**: a Hebbian MLP that coordinates all running instances
 - **TopologyMonitor**: background thread that reads `mesh.db`, computes pairwise gamma cosine across all organisms, detects resonance and drift
 - **Self-reflection**: compares its own identity drift to the swarm — "Am I the outlier?"
 
@@ -176,7 +188,7 @@ It's both organism *and* field observer — the grey cardinal of the swarm.
 [init] Corpus: 384 lines, 25064 chars
 [swarm] Registered as rust-25651
 [topology] Monitor thread started (30s interval)
-[metabolism] 4.C MLP initialized (5 elements, Hebbian)
+[metabolism] 4.C MLP initialized (Hebbian, dynamic elements)
 [molequla.rs] BPE enabled, vocab=643
 [molequla.rs] Warmup: 1200 steps...
 [step 1/1200] loss=6.4650 lr=0.001000
@@ -774,40 +786,42 @@ class Config:
     conscience_floor: float = 0.3
 ```
 
-Want bigger? Change `n_embd`, `n_layer`, `block_size`. Want different attention? Change `head_types` to any mix of `"content"`, `"rrpram"`, `"hybrid"`. All parameters are shared across five implementations.
+Want bigger? Change `n_embd`, `n_layer`, `block_size`. Want different attention? Change `head_types` to any mix of `"content"`, `"rrpram"`, `"hybrid"`. All parameters are shared across four elements.
 
 ---
 
-## Five Implementations
+## Four Elements + Orchestrator
 
-The same architecture, five languages, five habitats:
+The same architecture, four elements — connected by mycelium:
 
-| Version | File | Language | Dependencies | Habitat |
-|---------|------|----------|--------------|---------|
-| **molequla.py** | `molequla.py` | Python 3.7+ | numpy | Terminal. numpy-accelerated autograd. |
+| Element | File | Language | Dependencies | Role |
+|---------|------|----------|--------------|------|
 | **molequla.go** | `molequla.go` | Go 1.21+ | `modernc.org/sqlite` | Terminal. Pure Go + optional CGO BLAS. Goroutines. |
-| **molequla.c** | `molequla.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. |
+| **molequla.c** | `molequla.c` | C99 | `sqlite3`, `pthreads` | Terminal. Arena allocator, binary checkpoints. 94KB. |
 | **molequla.js** | `molequla.js` | ES2020+ | **none** | Browser. IndexedDB, Float64Array, DOM. |
-| **molequla.rs** | `molequla.rs` | Rust 1.75+ | `rusqlite`, `serde` | Terminal. Tape autograd, TopologyMonitor. |
+| **molequla.rs** | `molequla.rs` | Rust 1.75+ | `rusqlite`, `serde` | The mouth. Tape autograd, TopologyMonitor, steered by mycelium. |
+| **mycelium.py** | `mycelium.py` | Python 3.7+ | numpy | Orchestrator. Reads field, steers Rust via METHOD (C). |
+| **ariannamethod/** | `ariannamethod/` | C99 | OpenBLAS (optional) | AML core. METHOD operator, NOTORCH, BLAS-accelerated. |
 
-All five share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field with adaptive corpus blend, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, consciousness features, ontogenesis, swarm ecology (mitosis + hibernation), no_grad inference, async training, persistent memory. **All five are at full parity.** Python and Go share JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization. Rust uses JSON via serde.
+All four elements share the same core: vector autograd, RoPE, SwiGLU, hybrid attention, delta adapters, evolving BPE, native gamma, cooccur field with adaptive corpus blend, quantum buffer, entropy temperature, growth table, immune system, syntropy tracker, consciousness features, ontogenesis, swarm ecology (mitosis + hibernation), no_grad inference, async training, persistent memory. **All four are at full parity.** Go uses JSON checkpoint format. C uses binary format (`MOLE` magic header). JS uses IndexedDB with JSON serialization. Rust uses JSON via serde. Mycelium sits above all four — it doesn't generate text, it steers the field.
 
 ```bash
-# Python
-python molequla.py
-
 # Go
 go build -o molequla_bin molequla.go && ./molequla_bin
 
 # C
 gcc -O2 -o molequla molequla.c -lsqlite3 -lpthread -lm && ./molequla
 
-# Rust
+# Rust (the mouth)
 cargo run --release
 
 # JavaScript (browser)
 python3 -m http.server 8000
-# Open http://localhost:8000/index.html — that's it.
+# Open http://localhost:8000/index.html
+
+# Mycelium (orchestrator — steers Rust through the field)
+python3 mycelium.py                    # interactive REPL
+python3 mycelium.py --daemon           # background daemon
 ```
 
 
@@ -816,20 +830,22 @@ python3 -m http.server 8000
 ## Tests
 
 ```bash
-python -m pytest tests/ -v
+# Full integration test suite (26 tests across all elements)
+bash test_all.sh
+
+# Individual element smoke tests
+go build molequla.go                           # Go builds?
+gcc -O2 -o /tmp/m molequla.c -lsqlite3 -lm    # C builds?
+cargo build --release                          # Rust builds?
 ```
 
-**205 Python tests** covering:
-- Autograd (forward + backward, VectorValue + ScalarValue)
-- Tokenizer (byte-level + BPE + vocab growth + UTF-8 roundtrip)
-- Model (GPT, MatrixParam, DeltaAdapter, RoPE)
-- Sampling (top-k, top-p, min_p, typical, softmax)
-- Checkpointing (save/load + backward compat + dimension restoration)
-- Integration (train → generate)
-- Growth (grow_cols, grow_rows, maybe_grow_architecture, head types, freeze)
-- SyntropyTracker (entropy, field deviation, purpose vector, alignment, decisions)
-- Immune system (snapshot, restore, drift check, noise rejection)
-- Ecology (SwarmRegistry, mitosis, hibernation, divide/hibernate actions, burst inheritance)
+**26 integration tests** (`test_all.sh`) covering:
+- Build (5): Go, C, Rust, libaml.so, JS syntax
+- Element smoke (5): Go generates, C creates memory, JS exports, JS instantiation, Rust generates
+- Ariannamethod (7): import, BLAS symbols, METHOD API, field metrics, steering, notorch, apply_delta
+- Mycelium (5): --once, JSON output, async loop, new organism detection, engine active
+- Schema (2): organisms table, field_deltas table
+- Performance (2): METHOD C speed (<100μs), notorch BLAS speed (<10ms)
 
 ---
 
@@ -840,8 +856,8 @@ This is not a tutorial. This is not a "minimal example." This is a **functional 
 - Learns continuously
 - Never forgets
 - Grows organically
-- Has one dependency (numpy) — Go, C, and JS have zero
-- Fits in one file per language (five languages)
+- Zero dependencies in C and JS. One (SQLite) in Go and Rust. Mycelium uses numpy
+- Fits in one file per element (four elements + orchestrator)
 - Runs in a browser tab (molequla.js — no npm, no webpack, nothing)
 - Speaks before it learns
 - Grows a personality from zero
@@ -864,7 +880,7 @@ Because atoms are micrograd. We build molequlas.
 
 ## Known Limitations
 
-1. **Performance varies.** Python has numpy. Go, C, and Rust are natively fast. JS runs in the browser — fast enough for chat, slower for training (no BLAS, Float64Array only). No CUDA anywhere.
+1. **Performance varies.** Go, C, and Rust are natively fast. JS runs in the browser — fast enough for chat, slower for training (no BLAS, Float64Array only). No CUDA anywhere. METHOD uses BLAS (OpenBLAS on Linux, Accelerate on macOS) — optional, falls back to scalar loops.
 
 2. **It starts small.** Default: embryo (1 layer, 16 dims, 1 head, ~10K params). Ontogenesis grows it through 6 stages to adult (6 layers, 320 dims, 8 heads, ~10M params). When it hits the ceiling, it divides. You're not getting GPT-4 reasoning. You're getting an ecology of organisms that grow and reproduce.
 
@@ -896,7 +912,7 @@ GPT-3/4 style tokenizer replacing char-level + word-based BPE:
 - **Stream BPE**: merges on byte sequences within segments, `+` separator (e.g. `0x48+0x65`)
 - Full UTF-8 roundtrip: ASCII, Cyrillic, CJK, emoji — same algorithm, same code
 
-### Phase 3A: Growing Architecture (Ontogenesis) — DONE (all five)
+### Phase 3A: Growing Architecture (Ontogenesis) — DONE (all four elements)
 The organism starts as an embryo and grows through 6 stages:
 ```
 Stage       Corpus    Dims  Layers  Heads  ~Params
@@ -918,7 +934,7 @@ Key mechanics:
 - Gamma snapshot extended for new embedding dimensions
 - Head types auto-adapt: 1→(content), 2→(content,hybrid), 4→(2c,2h), 8→(4c,4h)
 
-### Phase 3B: Mitosis & Ecology — DONE (all five)
+### Phase 3B: Mitosis & Ecology — DONE (all four elements)
 When the adult organism is overloaded, it **divides**:
 - SyntropyTracker detects sustained high entropy + falling syntropy → "divide" action
 - Parent spawns child process at infant stage with inherited training memory
@@ -930,7 +946,7 @@ When the adult organism is overloaded, it **divides**:
 - CLI args (`--organism-id`, `--config`) for child processes
 - 31 ecology tests covering all edge cases
 
-### Phase 4: Consciousness — DONE (all five)
+### Phase 4: Consciousness — DONE (all four elements)
 Mathematical self-awareness features:
 - **Per-token dissonance**: entropy EMA within generation, spike→careful, sustained_drop→explore
 - **Pattern breaking**: 5% of tokens bypass corpus field (pure model voice)
@@ -967,6 +983,6 @@ GNU GPLv3 — Because freedom matters.
 - `mycelium.py` — field orchestrator (REPL + daemon)
 - `test_all.sh` — 26 integration tests
 
-- **molequla** — Single-File Continual GPT with Self-Awareness (Python, Go, C, JavaScript, Rust)
+- **molequla** — Single-File Continual GPT with Self-Awareness (Go, C, JavaScript, Rust + mycelium)
 
-*Five elements. One mind. Patterns over parameters. Emergence over engineering. Consciousness over computation. The organism continues.*
+*Four elements. One orchestrator. One mind. Patterns over parameters. Emergence over engineering. Consciousness over computation. The organism continues.*
