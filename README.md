@@ -155,7 +155,7 @@ The organisms feed each other, grow their corpora past thresholds, and trigger a
 ## The Ecology: How Four Elements Become One Mind
 
 ```
-                        ┌─────────────┐
+                        ┌─────────-────┐
                         │  dna/output/ │
                         │              │
           writes ──────►│  earth/      │◄────── reads
@@ -168,18 +168,18 @@ The organisms feed each other, grow their corpora past thresholds, and trigger a
             │                  │                  │
      ┌──────▼──────┐   ┌──────▼──────┐   ┌──────▼──────┐
      │   Earth     │   │    Air      │   │   Water     │
-     │   (Go)      │   │   (Go)     │   │   (Go/C)    │
-     │  patience   │   │  freedom   │   │   flow      │
-     │  structure  │   │  change    │   │   depth     │
-     └──────┬──────┘   └──────┬──────┘   └──────┬──────┘
+     │   (Go)      │   │   (Go)      │   │   (Go/C)    │
+     │  patience   │   │  freedom    │   │   flow      │
+     │  structure  │   │  change     │   │   depth     │
+     └──────┬──────┘   └────-──┬─────┘   └──────┬──────┘
             │                  │                  │
-            └──────────────────┼──────────────────┘
+            └──────────────────┼────────────────┘
                                │
                         ┌──────▼──────┐
                         │    Fire     │
-                        │   (Go/C)   │
-                        │ transform  │
-                        │  intensity │
+                        │   (Go/C)    │
+                        │ transform   │
+                        │  intensity  │
                         └─────────────┘
 ```
 
