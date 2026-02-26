@@ -4984,7 +4984,7 @@ func dnaWrite(element string, model *GPT, tok *EvolvingTokenizer, field *Cooccur
 	// GenerateResonant takes model.mu.Lock internally — do NOT double-lock
 	answer := GenerateResonant(model, tok, field, probe, docs, true)
 
-	if answer == "" || len(answer) < 20 {
+	if answer == "" || len(answer) < 5 {
 		return
 	}
 
@@ -5022,7 +5022,7 @@ func dnaRead(element string, corpusPath string, qbuf *QuantumBuffer, tok *Evolvi
 				continue
 			}
 			text := strings.TrimSpace(string(data))
-			if len(text) < 10 {
+			if len(text) < 5 {
 				os.Remove(fpath)
 				continue
 			}
