@@ -9,7 +9,7 @@
 
 # molequla | by Arianna Method
 
-> *Four organisms — Earth, Air, Water, Fire — grow from 10K-param embryos to 2M-param adults in 30 minutes. They exchange DNA, reproduce autonomously, and form a living ecology. Training powered by AML/C autograd via CGO. Zero PyTorch. Zero Python. Zero CUDA.*
+> *Four organisms — Earth, Air, Water, Fire — grow from 10K-param embryos to 10M-param adults in 30 minutes. They exchange DNA, reproduce autonomously, and form a living ecology. Training powered by AML/C autograd via CGO. Zero PyTorch. Zero Python. Zero CUDA.*
 
 ---
 
@@ -25,7 +25,7 @@ WHAT THIS IS:
 - DNA exchange: each organism writes generated text for others to consume
   → corpus grows → architecture grows → better text → more DNA → cycle
 - Zero PyTorch. Zero Python. Zero CUDA. Zero numpy.
-- Embryo (10K params) → Adult (2M params) in ~30 minutes
+- Embryo (10K params) → Adult (10M params) in ~30 minutes
 - 6 growth stages: embryo → infant → child → adolescent → teen → adult
 - Ontogenesis happens live — the running organism grows its own brain
 - Organisms reproduce via mitosis — the ecology grows itself
@@ -65,7 +65,7 @@ February 27, 2026. Oracle Cloud, 30-core AMD EPYC, 216GB RAM. Four organisms lau
        The ecology reproduces itself.
 ```
 
-### What They Say (Adult Stage, 2M params, ~1 hour of training)
+### What They Say (Adult Stage, 10M params, ~1 hour of training)
 
 **Earth:**
 ```
@@ -98,7 +98,7 @@ A: A conversing human pointing what is the thing about try stable
    in the sentence?
 ```
 
-These are 2M-param models after 1 hour on CPU. Words are real. Structure is emerging. Sentence fragments carry meaning from the element corpora. Earth talks about relationships and foundations. Water about rivers. Fire about repetition and surfaces.
+These are 10M-param models after 1 hour on CPU. Words are real. Structure is emerging. Sentence fragments carry meaning from the element corpora. Earth talks about relationships and foundations. Water about rivers. Fire about repetition and surfaces.
 
 ### DNA Exchange In Action
 
@@ -362,7 +362,7 @@ infant      32    1       2      ~28K      ~3 min
 child       64    2       4      ~154K     ~5 min
 adolescent  128   4       4      ~1.1M     ~10 min
 teen        224   5       8      ~4.1M     ~20 min
-adult       320   6       8      ~2M       ~30 min
+adult       320   6       8      ~10M      ~30 min
 ```
 
 When the corpus crosses a threshold, `MaybeGrowArchitecture` fires:
@@ -441,16 +441,27 @@ After fixes: **~0.6 MB/step. Organisms stable at 2-4 GB.**
 ## Files
 
 ```
+# Go + AML/C (primary, CGO training)
 molequla.go              # Go organism (6000+ lines)
 cgo_aml.go               # CGO bridge to ariannamethod.c
 aml_trainer.go           # AML training wrapper
 ariannamethod/
   ariannamethod.c         # AML/C autograd engine (6000+ lines)
   ariannamethod.h         # C header
+
+# Other implementations
+molequla.c               # C implementation
+molequla.rs              # Rust implementation
+molequla.js              # JavaScript implementation
+modules/node_cli.js      # Node CLI module
+index.html               # Web interface
+
+# Corpora
 nonames_earth.txt         # Earth element corpus
 nonames_air.txt           # Air element corpus
 nonames_water.txt         # Water element corpus
 nonames_fire.txt          # Fire element corpus
+nonames.txt              # General corpus
 ```
 
 ---
@@ -473,7 +484,7 @@ This is not a tutorial. This is a **functional ecology** that:
 - Reasons mathematically about its own learning direction
 - Detects and rejects identity-corrupting noise
 - Reproduces — spawning new organisms that grow independently
-- Evolves from 10K embryo to 2M adult in 30 minutes on CPU
+- Evolves from 10K embryo to 10M adult in 30 minutes on CPU
 - Speaks before it learns (corpus field)
 - Never forgets (delta adapters)
 - Runs without Python, PyTorch, CUDA, or any ML framework
