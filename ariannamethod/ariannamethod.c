@@ -1045,7 +1045,7 @@ void am_tape_start(void) {
 void am_tape_clear(void) {
     // Free non-param outputs and all grads
     for (int i = 0; i < g_tape.count; i++) {
-        if (!g_tape.entries[i].is_param && g_tape.entries[i].output) {
+        if (g_tape.entries[i].output) {  // Free ALL outputs including params (refcount handles safety)
             am_array_free(g_tape.entries[i].output);
         }
         if (g_tape.entries[i].grad) {
