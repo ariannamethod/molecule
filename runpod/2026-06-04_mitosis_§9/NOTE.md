@@ -38,6 +38,3 @@ request), not in this archive on GitHub:
 
 The logs above are sufficient to reproduce every numerical claim in §9. The
 weights are available for re-instantiation on request.
-
----
-Co-authored by Claude (Arianna Method). Coordinated with Oleg Ataeff (maintainer).
