@@ -5037,6 +5037,11 @@ type SyntropyTracker struct {
 func NewSyntropyTracker() *SyntropyTracker {
 	return &SyntropyTracker{
 		LastAction: "none",
+		// Seed birth time so the 300s divide cooldown (CASE 6, now-LastMitosisTime>300)
+		// also guards the FIRST division. Zero-init made now(epoch-sec)-0 always >300,
+		// so seed organisms and every mitosis child could divide instantly. Applies
+		// uniformly: the seed tracker here and each child's fresh tracker (backgroundTrainer).
+		LastMitosisTime: float64(time.Now().UnixMilli()) / 1000.0,
 	}
 }
 
@@ -5603,6 +5608,10 @@ func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *Swarm
 	if err := cmd.Start(); err != nil {
 		return "", err
 	}
+	// Reap the child on its eventual exit so it cannot become a zombie of this
+	// long-lived parent. cmd.Start without a matching Wait leaks a zombie per
+	// division — across a cascade that accumulates and feeds process-table pressure.
+	go func() { _ = cmd.Wait() }()
 
 	syntracker.LastMitosisTime = float64(time.Now().UnixMilli()) / 1000.0
 	fmt.Printf("[ecology] Child %s spawned (pid=%d)\n", childID, cmd.Process.Pid)

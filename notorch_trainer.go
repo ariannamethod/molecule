@@ -361,7 +361,10 @@ func ntTrainCore(model *GPT, tok *EvolvingTokenizer, docs []string, steps, seqLe
 	elapsedMs := float64(time.Since(t0).Microseconds()) / 1000.0
 
 	// Mirror trained weights back into the canonical model.Base store.
+	// Sync each tensor's host mirror from device first — ntx_get is a raw memcpy
+	// from t->data, which is stale after GPU training on the cuda build (no-op on CPU).
 	for i, p := range params {
+		ntTensorSyncCPU(tensors[i])
 		ntUnflattenMatrix(p.mp, ntTensorGet(tensors[i], p.mp.Nout*p.mp.Nin))
 	}
 	// Inc2: split the trained combined Wr back into the wr_a / wr_b Base matrices.
@@ -375,6 +378,7 @@ func ntTrainCore(model *GPT, tok *EvolvingTokenizer, docs []string, steps, seqLe
 			if a == nil || b == nil {
 				continue
 			}
+			ntTensorSyncCPU(wrTensors[l])
 			ntUnpackWr(model, l, ntTensorGet(wrTensors[l], a.Nout*a.Nin+b.Nout*b.Nin))
 		}
 	}
