@@ -5093,13 +5093,26 @@ func (st *SyntropyTracker) RecordBurst(action string, lossBefore, lossAfter floa
 // cooldown on the same stale overload — division now relieves the overwhelm
 // (cascade governor, audit design item (c)).
 func (st *SyntropyTracker) relieveOverload() {
-	kept := st.BurstHistory[:0]
+	// loss path: drop the high-loss bursts that triggered this divide
+	kb := st.BurstHistory[:0]
 	for _, br := range st.BurstHistory {
 		if br.LossAfter < CFG.OverloadLossHigh {
-			kept = append(kept, br)
+			kb = append(kb, br)
 		}
 	}
-	st.BurstHistory = kept
+	st.BurstHistory = kb
+	// entropy path (audit C2): drop the high-entropy samples too, so
+	// entropyOverload() also clears. isSustainedOverload = entropy OR loss, and
+	// §9 Air divided on the entropy path (e=true l=false) — relieving only loss
+	// left an entropy-overloaded parent/child re-firing every cooldown. Division
+	// now relieves BOTH overwhelm modes.
+	ke := st.EntropyHistory[:0]
+	for _, e := range st.EntropyHistory {
+		if e <= CFG.EntropyHigh {
+			ke = append(ke, e)
+		}
+	}
+	st.EntropyHistory = ke
 }
 
 // ActionEffectiveness returns the mean loss delta for a given action type.
@@ -5492,8 +5505,49 @@ func (sr *SwarmRegistry) initMeshDB() error {
 		db.Close()
 		return err
 	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS mitosis_lock(
+		organism_id TEXT PRIMARY KEY, acquired_at REAL)`)
+	if err != nil {
+		db.Close()
+		return err
+	}
 	sr.MeshDB = db
 	return nil
+}
+
+// AcquireMitosisSlot atomically admits a divide ONLY if (a) no other organism is
+// mid-divide (mitosis_lock free) AND (b) the live colony is below maxOrganisms —
+// one SQL statement, TOCTOU-safe across the multi-process lineage (audit C3: the
+// old len(DiscoverPeers)+1 check-then-act let concurrent dividers overshoot the
+// cap). The lock self-expires after 30s, which spans the child's registration
+// window so the next admit counts the new child. maxOrganisms<=0 disables the cap.
+func (sr *SwarmRegistry) AcquireMitosisSlot(maxOrganisms int) bool {
+	if sr.MeshDB == nil || maxOrganisms <= 0 {
+		return true
+	}
+	now := float64(time.Now().UnixMilli()) / 1000.0
+	lockCutoff := now - 30.0 // mitosis lock expiry
+	liveCutoff := now - 60.0 // heartbeat freshness (matches DiscoverPeers window)
+	result, err := sr.MeshDB.Exec(
+		`INSERT OR REPLACE INTO mitosis_lock(organism_id, acquired_at)
+		 SELECT ?, ? WHERE
+		   NOT EXISTS (SELECT 1 FROM mitosis_lock WHERE organism_id != ? AND acquired_at > ?)
+		   AND (SELECT COUNT(*) FROM organisms WHERE status='alive' AND last_heartbeat > ?) < ?`,
+		sr.OrganismID, now, sr.OrganismID, lockCutoff, liveCutoff, maxOrganisms)
+	if err != nil {
+		return false
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0
+}
+
+// ReleaseMitosisLock frees the slot early (on a failed spawn). On success the lock
+// is left to expire so the new child registers before the next divide is admitted.
+func (sr *SwarmRegistry) ReleaseMitosisLock() {
+	if sr.MeshDB == nil {
+		return
+	}
+	sr.MeshDB.Exec(`DELETE FROM mitosis_lock WHERE organism_id = ?`, sr.OrganismID)
 }
 
 func (sr *SwarmRegistry) registerInMesh() error {
@@ -5610,13 +5664,6 @@ func (sr *SwarmRegistry) ReleaseTrainingLock() {
 	sr.MeshDB.Exec("DELETE FROM training_lock WHERE organism_id=?", sr.OrganismID)
 }
 
-// capAllowsDivide reports whether the colony may grow by one. The per-process
-// 300s mitosis cooldown cannot bound a multi-process lineage, so this hard cap
-// (CFG.MaxOrganisms, 0 = disabled) is the backstop against unbounded process/RAM growth.
-func capAllowsDivide(live, max int) bool {
-	return max <= 0 || live < max
-}
-
 // performMitosis divides the organism. Parent continues. The child inherits the
 // parent's growth stage via the checkpoint dimensions (not infant).
 func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *SwarmRegistry, syntracker *SyntropyTracker) (string, error) {
@@ -5625,6 +5672,13 @@ func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *Swarm
 	if err := os.MkdirAll(childDir, 0755); err != nil {
 		return "", err
 	}
+
+	// (audit C4 + c) Relieve the parent's overload and stamp the cooldown BEFORE
+	// capturing the inherited history below — so the child does NOT inherit a
+	// pre-overloaded burst/entropy state (which made it divide again the instant
+	// its own 300s cooldown cleared). Division relieves the overwhelm at the root.
+	syntracker.LastMitosisTime = float64(time.Now().UnixMilli()) / 1000.0
+	syntracker.relieveOverload()
 
 	// Save parent checkpoint for child's reference
 	parentCkpt := filepath.Join(childDir, "parent_ckpt.json")
@@ -5658,20 +5712,42 @@ func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *Swarm
 	if err != nil {
 		exePath = os.Args[0]
 	}
-	cmd := exec.Command(exePath, "--organism-id", childID, "--config", birthPath)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	// (audit BUG A) The child must run AUTONOMOUS — inherit the parent's run mode
+	// (--evolution always; --gpu/--cross-graze/--element to match). Without these
+	// it booted into the interactive REPL ("Type and press Enter") and stalled.
+	childArgs := []string{"--organism-id", childID, "--config", birthPath, "--evolution"}
+	if CFG.UseGPU {
+		childArgs = append(childArgs, "--gpu")
+	}
+	if CFG.CrossGraze {
+		childArgs = append(childArgs, "--cross-graze")
+	}
+	base := filepath.Base(CFG.CorpusPath)
+	if strings.HasPrefix(base, "nonames_") && strings.HasSuffix(base, ".txt") {
+		childArgs = append(childArgs, "--element", strings.TrimSuffix(strings.TrimPrefix(base, "nonames_"), ".txt"))
+	}
+	cmd := exec.Command(exePath, childArgs...)
+	// (audit BUG B) Child writes its OWN log, not the parent's stdout — inheriting
+	// os.Stdout mixed the whole lineage into one file and made monitoring impossible.
+	childLog, _ := os.Create(filepath.Join(childDir, "train.log"))
+	if childLog != nil {
+		cmd.Stdout = childLog
+		cmd.Stderr = childLog
+	} else {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
 	if err := cmd.Start(); err != nil {
+		if childLog != nil {
+			childLog.Close()
+		}
 		return "", err
 	}
-	// Reap the child on its eventual exit so it cannot become a zombie of this
-	// long-lived parent. cmd.Start without a matching Wait leaks a zombie per
-	// division — across a cascade that accumulates and feeds process-table pressure.
-	go func() { _ = cmd.Wait() }()
+	// Reap the child on its eventual exit (no zombie of this long-lived parent)
+	// and close its log handle.
+	go func() { _ = cmd.Wait(); if childLog != nil { childLog.Close() } }()
 
-	syntracker.LastMitosisTime = float64(time.Now().UnixMilli()) / 1000.0
-	syntracker.relieveOverload() // (c) division relieved the overwhelm — drop the triggering high-loss bursts so the parent re-divides only on NEW overload, not every cooldown
-	fmt.Printf("[ecology] Child %s spawned (pid=%d)\n", childID, cmd.Process.Pid)
+	fmt.Printf("[ecology] Child %s spawned (pid=%d) — log %s/train.log\n", childID, cmd.Process.Pid, childDir)
 	return childID, nil
 }
 
@@ -6468,14 +6544,17 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 
 			// Ecology: mitosis / hibernation
 			if swarm != nil && action == "divide" {
-				live := len(swarm.DiscoverPeers(60)) + 1 // alive peers (excl. self) + self
-				if !capAllowsDivide(live, CFG.MaxOrganisms) {
-					fmt.Printf("[ecology] MITOSIS refused — colony at cap (%d/%d)\n", live, CFG.MaxOrganisms)
+				// (audit C3) atomic admit: serialized + count-capped across processes
+				if !swarm.AcquireMitosisSlot(CFG.MaxOrganisms) {
+					fmt.Printf("[ecology] MITOSIS refused — colony at cap (%d) or a sibling is dividing\n", CFG.MaxOrganisms)
 				} else {
 					fmt.Println("[ecology] MITOSIS triggered — organism overloaded, spawning child")
 					model.mu.Lock()
-					performMitosis(model, tok, db, swarm, syntracker)
+					_, mErr := performMitosis(model, tok, db, swarm, syntracker)
 					model.mu.Unlock()
+					if mErr != nil {
+						swarm.ReleaseMitosisLock() // spawn failed — free the slot now (success holds it to expiry)
+					}
 				}
 			}
 

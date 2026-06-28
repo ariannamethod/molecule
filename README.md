@@ -29,7 +29,8 @@ WHAT THIS IS:
 - Hybrid attention: content + RRPRAM + learnable sigmoid gate per head
 - Corpus field: 4-gram co-occurrence physics, self-enrichment loop
 - SyntropyTracker: 8 autonomous decisions based on entropy/KL/purpose
-- Mitosis: adults divide under sustained overload (loss path and entropy path both fire), child inherits parent weights — machine-verified on GPU 2026-06-04 (**5 `action=divide` firings across 3 adults**: fire ×1 loss-path, water ×1 loss-path, air ×3 mixed paths; **earth never divided**; 2 children spawned, Fire's preserved in full with a birth manifest, Air's as a spawn log line; observed cascading to ~50 spawns)
+- Mitosis: adults divide under sustained overload (loss path and entropy path both fire), child inherits parent weights — machine-verified on GPU 2026-06-04 (**5 `action=divide` firings across 3 adults**: fire ×1 loss-path, water ×1 loss-path, air ×3 mixed paths; **earth never divided**; 2 children spawned, Fire's preserved in full with a birth manifest, Air's as a spawn log line; observed cascading to ~50 spawns — this is the **pre-governor** run)
+- Cascade governor (branch `molequla-mythos-audit`): the colony is now bounded — `CFG.MaxOrganisms` (default 16) enforced by an atomic mesh.db admit, the 300s divide cooldown seeded at birth, and divide relieving **both** loss and entropy overload so a divider re-divides only on fresh overwhelm. The ~50-spawn cascade above predates the governor; with it the colony self-limits and caps at MaxOrganisms.
 - Mycelium: meta-organism coordinator over the ecology via mesh.db field-steering
   (HarmonicNet, FieldPulse, SteeringDissonance, OrganismAttention) — **post-§9 layer**; the 2026-06-04 §9 mitosis run did not use mycelium (`PROJECT_LOG.md:2601`)
 - NOTORCH: gradient-free delta-training path (implemented, currently dormant —
