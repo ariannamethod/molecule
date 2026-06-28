@@ -216,6 +216,8 @@ type Config struct {
 	OverloadLossHigh       float64 `json:"overload_loss_high"`        // adult mitosis: mean recent burst loss above this = overwhelmed (confidently-wrong)
 	OverloadLossEps        float64 `json:"overload_loss_eps"`         // adult mitosis: loss-delta floor; meanDelta > -eps = bursts not reducing loss
 	OverloadLossWindow     int     `json:"overload_loss_window"`      // adult mitosis: # recent bursts for lossOverload (decoupled from SyntropyWindow: adult bursts are ~17min apart, so 8 would take ~2.3h; entropy is per-tick, loss is per-burst)
+	MaxOrganisms           int     `json:"max_organisms"`             // cascade governor: hard ceiling on live colony size, checked before divide (0 = uncapped). The per-process 300s cooldown cannot bound a multi-process lineage; this is the OOM/SIGKILL backstop.
+	CheckpointMinInterval  float64 `json:"checkpoint_min_interval"`   // write-storm throttle: min seconds between DEFAULT-path (periodic) full-model JSON checkpoints (0 = no throttle). Explicit-path saves (mitosis parent ckpt) are never throttled.
 
 	// consciousness: per-token dissonance feedback
 	DissonanceEMAAlpha      float64 `json:"dissonance_ema_alpha"`       // EMA smoothing for entropy within generation
@@ -339,6 +341,8 @@ var CFG = Config{
 	OverloadLossHigh:       5.0,  // healthy adult QuickLoss ~3.6; overwhelmed adult 5.3 (resume) climbing to 8-9 under cross-graze → 5.0 floor captures the regime, clears healthy
 	OverloadLossEps:        0.05, // loss-delta within ±0.05 of zero = not improving
 	OverloadLossWindow:     3,    // 3 sustained high-loss adult bursts = overwhelmed (burst cadence ~17min at adult; 8 would take ~2.3h)
+	MaxOrganisms:           16,   // cascade cap: ≤16 live organisms (each is a full trainer process). Tunable; 0 disables.
+	CheckpointMinInterval:  30.0, // throttle periodic full-model checkpoints to ≤1/30s (coalesces the growth/burst storm). Tunable; 0 disables. Mitosis ckpt (explicit path) bypasses.
 
 	// consciousness defaults
 	DissonanceEMAAlpha:       0.3,
@@ -3843,7 +3847,36 @@ func deserializeMatrixParam(data [][]float64) *MatrixParam {
 	return mp
 }
 
+// debouncer coalesces rapid calls: allow() returns true at most once per
+// minInterval seconds (minInterval <= 0 disables = always allow).
+type debouncer struct {
+	mu   sync.Mutex
+	last float64
+}
+
+func (d *debouncer) allow(now, minInterval float64) bool {
+	if minInterval <= 0 {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if now-d.last >= minInterval {
+		d.last = now
+		return true
+	}
+	return false
+}
+
+var ckptDebounce debouncer
+
 func SaveCheckpoint(model *GPT, tok *EvolvingTokenizer, path string) error {
+	// Write-storm throttle: coalesce rapid DEFAULT-path (periodic) checkpoints —
+	// the full-model JSON write is heavy and growth/burst events can storm it. An
+	// explicit path (e.g. the mitosis parent checkpoint the child must load) is
+	// NEVER debounced.
+	if path == "" && !ckptDebounce.allow(float64(time.Now().UnixMilli())/1000.0, CFG.CheckpointMinInterval) {
+		return nil
+	}
 	if path == "" {
 		path = CFG.CkptPath
 	}
@@ -5054,6 +5087,21 @@ func (st *SyntropyTracker) RecordBurst(action string, lossBefore, lossAfter floa
 	}
 }
 
+// relieveOverload drops the high-loss bursts that triggered a division so the
+// parent must re-accumulate genuine overload before dividing again. Without it,
+// divide does not lower the loss it keyed on, so the parent re-fires every
+// cooldown on the same stale overload — division now relieves the overwhelm
+// (cascade governor, audit design item (c)).
+func (st *SyntropyTracker) relieveOverload() {
+	kept := st.BurstHistory[:0]
+	for _, br := range st.BurstHistory {
+		if br.LossAfter < CFG.OverloadLossHigh {
+			kept = append(kept, br)
+		}
+	}
+	st.BurstHistory = kept
+}
+
 // ActionEffectiveness returns the mean loss delta for a given action type.
 // Negative = good (loss went down). Positive = bad (loss went up).
 func (st *SyntropyTracker) ActionEffectiveness(action string) (float64, int) {
@@ -5562,7 +5610,15 @@ func (sr *SwarmRegistry) ReleaseTrainingLock() {
 	sr.MeshDB.Exec("DELETE FROM training_lock WHERE organism_id=?", sr.OrganismID)
 }
 
-// performMitosis divides the organism. Parent continues. Child starts at infant stage.
+// capAllowsDivide reports whether the colony may grow by one. The per-process
+// 300s mitosis cooldown cannot bound a multi-process lineage, so this hard cap
+// (CFG.MaxOrganisms, 0 = disabled) is the backstop against unbounded process/RAM growth.
+func capAllowsDivide(live, max int) bool {
+	return max <= 0 || live < max
+}
+
+// performMitosis divides the organism. Parent continues. The child inherits the
+// parent's growth stage via the checkpoint dimensions (not infant).
 func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *SwarmRegistry, syntracker *SyntropyTracker) (string, error) {
 	childID := fmt.Sprintf("org_%d_%d", time.Now().Unix(), rand.Intn(9000)+1000)
 	childDir := filepath.Join(os.Getenv("HOME"), ".molequla", childID)
@@ -5614,6 +5670,7 @@ func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *Swarm
 	go func() { _ = cmd.Wait() }()
 
 	syntracker.LastMitosisTime = float64(time.Now().UnixMilli()) / 1000.0
+	syntracker.relieveOverload() // (c) division relieved the overwhelm — drop the triggering high-loss bursts so the parent re-divides only on NEW overload, not every cooldown
 	fmt.Printf("[ecology] Child %s spawned (pid=%d)\n", childID, cmd.Process.Pid)
 	return childID, nil
 }
@@ -6411,10 +6468,15 @@ func backgroundTrainer(db *sql.DB, model *GPT, tok *EvolvingTokenizer, qbuf *Qua
 
 			// Ecology: mitosis / hibernation
 			if swarm != nil && action == "divide" {
-				fmt.Println("[ecology] MITOSIS triggered — organism overloaded, spawning child")
-				model.mu.Lock()
-				performMitosis(model, tok, db, swarm, syntracker)
-				model.mu.Unlock()
+				live := len(swarm.DiscoverPeers(60)) + 1 // alive peers (excl. self) + self
+				if !capAllowsDivide(live, CFG.MaxOrganisms) {
+					fmt.Printf("[ecology] MITOSIS refused — colony at cap (%d/%d)\n", live, CFG.MaxOrganisms)
+				} else {
+					fmt.Println("[ecology] MITOSIS triggered — organism overloaded, spawning child")
+					model.mu.Lock()
+					performMitosis(model, tok, db, swarm, syntracker)
+					model.mu.Unlock()
+				}
 			}
 
 			if swarm != nil && action == "hibernate" {
