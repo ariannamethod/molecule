@@ -70,6 +70,17 @@ func ntTensorGet(t ntTensor, n int) []float32 {
 	return out
 }
 
+// ntTensorSyncCPU refreshes a tensor's host mirror (t->data) from device before
+// a host read. ntx_get does a raw memcpy from t->data, so on the cuda build a
+// GPU-trained tensor must be synced first or the readback into model.Base is
+// stale. No-op on the non-cuda build (nt_tensor_sync_cpu is (void)t there).
+func ntTensorSyncCPU(t ntTensor) {
+	if t == nil {
+		return
+	}
+	C.nt_tensor_sync_cpu(t)
+}
+
 // ── Tape lifecycle ──
 // nt_tape_clear keeps Chuck m/v state (positional, keyed by registration order);
 // nt_tape_destroy wipes it — call destroy+start only after a growth event.
