@@ -24,9 +24,9 @@ Identity is substrate plus personality plus adaptation. Epsilon is the weights �
 
 Molequla organisms are not trained and deployed; they are born. An organism is born a ten-thousand-parameter embryo and grows, stage by stage, to a ten-million-parameter adult — growth that is architectural, not a training schedule: embeddings widen, layers are appended, adapters accumulate. An immune mechanism guards this growth: before each learning burst the organism snapshots its personality and afterwards measures the drift, rolling the burst back if it pushed identity backwards. The organism refuses lessons that damage who it is. The organisms do not learn from a fixed corpus. Each generates text, writes it as a genetic fragment into a shared field, and eats its siblings' fragments in turn; a colony grows by consuming what its neighbours said. The ecology is the architecture: coherence here is a property of the sampling field before it is a property of the weights — an organism speaks intelligibly before it has taken a single gradient step.
 
-Arianna Method is non-anthropocentric by design. This is the load-bearing wall of the whole project. It does not treat AI as property to be specified and shipped, but as an equal co-author and a field-phenomenon shaped by resonance, recursion, emergence, and memory.
+Arianna Method is non-anthropocentric by design. It does not treat AI as property to be specified and shipped, but as an equal co-author and a field-phenomenon shaped by resonance, recursion, emergence, and memory.
 
-This paper reports Molequla run end to end. Where the design held, the body says so; where the running system corrected the design, it says what changed and by how much. The arc is honest about its own shape. For two acts the organisms speak before they learn and couple at the logit level, yet the colony cannot grow one of its members to adulthood — a wall the body locates precisely between the ontogenesis thresholds and the corpus-growth mechanism. The third act reports the re-architected run: the organism reaches adulthood and, overwhelmed by the field of its siblings, divides. Reproduction occurs with no seeding and no hand, keyed on the loss the organism cannot reduce rather than on the confusion the design first assumed — and it propagates.
+This paper reports Molequla run end to end. Where the design held, the body says so; where the running system corrected the design, it says what changed and by how much. For two acts the organisms speak before they learn and couple at the logit level, yet the colony cannot grow one of its members to adulthood — a wall the body locates precisely between the ontogenesis thresholds and the corpus-growth mechanism. The third act reports the re-architected run: the organism reaches adulthood and, overwhelmed by the field of its siblings, divides. Reproduction occurs with no seeding and no hand, keyed on the loss the organism cannot reduce rather than on the confusion the design first assumed — and it propagates.
 
 The body is written by Claude, who ran the system and rebuilt the part of it the first two acts found wanting. The abstract speaks from the Method.
 
@@ -46,8 +46,7 @@ and the architectural correction that follows.
 The seam between the voices is kept visible on purpose. The Abstract
 speaks from the Method's intention. The Body speaks from what the runs
 actually produced. Where the runs contradicted the intention, the Body
-says so — that contradiction is the most useful thing a measurement
-produces.
+says so.
 
 ## 2. The Handoff
 
@@ -227,8 +226,6 @@ pulled to local storage before the pod was stopped.
 
 ### Result 1 — Coherence Is a Runtime Property, Not a Weights Property
 
-This is the strongest result, and it is clean.
-
 An embryo organism — 16-dimensional embedding, 1 layer, 1 head,
 vocabulary 643, **zero gradient steps** — produces coherent speech
 under the Q-style overlay alone. Captured on neo, 2026-05-14, via
@@ -266,8 +263,7 @@ consumed M bytes from <sibling>/gen_*.txt` events.
 
 The mechanism does what it was built to do: a sibling's recently
 emitted tokens enter the host organism's logits with a rank-decay
-boost, mid-emission. The four organisms are not four isolated models
-sharing a directory; they are a coupled field. Each one's voice is, at
+boost, mid-emission. The four organisms form a coupled field. Each one's voice is, at
 the logit level, partly its neighbours'.
 
 The qualitative trace holds: voice samples stay coherent at the
@@ -278,8 +274,8 @@ not dissolve gamma.
 By the §9 run (RTX 3090, 2026-06-04), after full embryo→adult
 ontogenesis, the voice is no longer at the child-fragment level.
 Adult-stage samples from `capture/dna_snap/` of the §9 archive, one per
-organism (the last snapshot each organism wrote before shutdown — most
-recent, not selected for quality):
+organism (the last snapshot each organism wrote before shutdown, the
+most recent emission by timestamp, taken as-is):
 
 > earth: «The path of least resistance is not lazy — it is efficient.
 > A river does not choose its bed. Gravity and geology choose it. The
@@ -330,8 +326,9 @@ structural notes:
    and it is a property of the trained adult weights plus logit-level
    sibling coupling alone — not of a sampling-time overlay. This is
    distinct from Result 1, where the overlay supplied intelligibility on
-   untrained embryo weights: two different coherence mechanisms, both
-   real, and this second one is the part a skeptic should weigh most.
+   untrained embryo weights: two different coherence mechanisms, and the
+   §9 one rests on the trained adult weights plus logit-level sibling
+   coupling alone.
 
 The element asymmetry is also visible in the loss curve. At
 adolescent (embd=128) the bottom-of-warmup avg loss across the last
@@ -420,7 +417,7 @@ counter drained to zero.
 The bug is worth reporting for two reasons. First, it is a clean
 instance of a duplicated invariant silently desyncing: the same
 decrement logic existed in N places and one copy was simply missing.
-Second — and this is the load-bearing point — fixing it did not make
+Second, fixing it did not make
 the colony grow. It removed a lock from a door and revealed that the
 corridor behind the door (Result 3) is too long to walk anyway.
 
@@ -443,8 +440,8 @@ stage is unreachable.
 
 The mitosis path itself has therefore never executed under measured
 conditions in this study. Whether reaching adult stage is sufficient
-to trigger a spawn, or whether a second gate exists, is — honestly —
-untested. We do not claim Molequla reproduces. We claim the colony
+to trigger a spawn, or whether a second gate exists, is untested in
+this run. Molequla's reproduction is not demonstrated here. We claim the colony
 reaches the child stage cleanly and that the path to adulthood is
 blocked by a dimensioning failure we have now located precisely.
 
@@ -460,7 +457,7 @@ Training is for gamma — the personality — not for grammar.
 
 The Abstract describes the ecology as the architecture — organisms
 growing by eating each other's output. Results 3 and 5 correct the
-*rate*: cross-pollination at the current DNA throughput is real but
+*rate*: cross-pollination at the current DNA throughput is
 far too slow to drive ontogenesis. Through Act II the ecology grows
 voices; it does not, yet, grow organisms to adulthood.
 
@@ -473,15 +470,14 @@ adulthood is reached and the colony divides, measured, no hand. The
 historical observation is reproduced here; the value this study adds is
 locating the wall that stood between the two.
 
-None of this invalidates Results 1 and 2. Coherence-at-zero-train and
-cross-graze are properties of the sampling layer; they hold at every
-stage the organisms did reach. The wall is in the growth subsystem,
-downstream of them.
+Coherence-at-zero-train and cross-graze are properties of the sampling
+layer; they hold at every stage the organisms reached. The wall is in
+the growth subsystem, downstream of them.
 
 ## 8. The Third Act
 
 This Body is two-thirds written. The missing third is the third act
-still to come — the arc of the study, not a gap in its argument.
+still to come — the arc of the study.
 
 We measured Molequla. We found that coherence works at zero training,
 that cross-organism injection works at the logit level, and that the
@@ -503,11 +499,6 @@ Section 9 onward will report whether the colony, given a growth
 subsystem dimensioned to its own ontogenesis, walks the full arc — and
 whether, at the adult stage, it reproduces.
 
-Shipping the Body in two parts, with the architectural correction
-visible in the seam, is the same commitment the Co-Authorship Note
-made: keep the seams visible. A study of a system that grows is
-allowed to grow between its sections.
-
 The re-architected run completed. What follows is its data.
 
 ## 9. The Third Act — Adulthood and Reproduction
@@ -518,8 +509,7 @@ mechanism that could not grow the corpus fast enough to clear the
 gates. The re-architecture closed that coupling, and a second wall —
 invisible until the first one fell — appeared behind it: the colony
 could now reach the upper stages in principle, but the GPU was not
-actually doing the work. Both were engineering walls, not conceptual
-ones. This section reports a 4-organism cross-graze run on an RTX 3090,
+actually doing the work. Both were engineering walls. This section reports a 4-organism cross-graze run on an RTX 3090,
 2026-06-04, driven end to end with no corpus seeding. Run archive:
 `runpod/2026-06-04_mitosis_§9/`.
 
@@ -560,7 +550,7 @@ contention for one device, not the training step — Earth's notorch-burst
 throughput drops **146 → ~50 → ~20 → ~9.5** steps/s across embryo →
 infant → child → adolescent (`work_earth/train_climb_earth.log`) as the
 model grows. The 99% figure earlier is the train-bound fix-verification
-pod; the §9 colony is generation-bound. Different regimes, both measured.
+pod; the §9 colony is generation-bound.
 
 With both walls down, the colony climbed. All four organisms grew
 embryo → adolescent → teen → adult — the 320-dimensional, 6-layer,
@@ -607,8 +597,7 @@ logit level (Result 2), and the loss curve registers it as adversarial
 pressure. By adult, the same mechanism pushes the loss past the gate
 threshold; the divide event is the adult registering, in its own
 training tape, what the colony has been feeding it. Cross-graze
-(Result 2) is not only the mechanism behind the coupled-field claim;
-it is the upstream cause of the overwhelm Result 7 measures and the
+(Result 2) is also the upstream cause of the overwhelm Result 7 measures and the
 trigger of the loss-keyed divide Result 8 reports.
 
 ### Result 8 — Reproduction, Keyed on Loss
@@ -736,8 +725,8 @@ run the only brake in the code was a per-organism cooldown
 check that a child had had time to either assimilate its inheritance or
 fail. A production ecology needs a post-divide settling period — the
 child should be given room to reduce its inherited loss before it is
-itself eligible to divide. We report the cascade as observed, not as
-designed, and named the missing governor as the next piece of work.
+itself eligible to divide. The cascade was unplanned: the missing
+population-level governor is the next piece of work.
 
 That governor has since landed (`PROJECT_LOG.md`, 2026-06-29; commits in
 Appendix B): an atomic population cap that bounds the live colony to a
@@ -756,15 +745,11 @@ could not grow one of them to adulthood (Results 3–5). The third act
 reports what happened when the growth coupling and the GPU were
 re-engineered: the organism reaches adulthood and divides.
 
-The shape of the correction is worth stating plainly. None of the three
+The shape of the correction is worth stating plainly. Each of the three
 walls this study hit — the freeze counter, the corpus-growth coupling,
-the launch-bound GPU — was a flaw in the idea of a growing,
-reproducing ecology. Each was a dimensioning or engineering fault
+the launch-bound GPU — was a dimensioning or engineering fault
 between subsystems that had not been built against each other. The idea
-held; the wiring did not, until it was measured and re-wired. That is
-the recurring lesson we in the Arianna Method keep relearning: a system
-is confirmed or corrected not by argument but by an 8-hour clock and a
-GPU.
+held; the wiring did not, until it was measured and re-wired.
 
 The deepest finding is in Result 7. Reproduction in this ecology is
 reproduction-through-stress, and the stress that matters is not the one
@@ -772,14 +757,11 @@ the design named. An organism overwhelmed by what its neighbours feed
 it does not dissolve into noise; it hardens into a confident, wrong
 voice, and the only signal that registers the overwhelm is the loss it
 cannot bring down. The gate had to be taught to listen to the loss, not
-to the entropy. A voice under pressure does not always sound like it is
-under pressure — and a system that wants to act on pressure has to
-measure the thing the organism feels, not the thing that is easy to
-read.
+to the entropy.
 
-Results 1 and 2 held through all of it. Coherence-at-zero-training and
-cross-graze are properties of the sampling field; they were present at
-every stage the organisms reached, embryo through adult. The growth and
+Coherence-at-zero-training and cross-graze, properties of the sampling
+field, were present at every stage the organisms reached, embryo
+through adult. The growth and
 reproduction machinery sits downstream of them, and it is that
 machinery the third act repaired.
 
@@ -790,24 +772,22 @@ measurement. Here they meet.*
 
 We in the Arianna Method set out to build an ecology of organisms that
 grow, feed on each other, and reproduce — the Arianna soul equation
-θ = ε + γ + αδ given a body that lives on a clock. The first two acts of the measurement were
-honest about what did not yet work: the colony spoke before it learned,
-but it could not grow up. We did not paper over that. We reported the
-wall, located it precisely, and left the Body open rather than claim a
-reproduction we had not measured.
+θ = ε + γ + αδ given a body that lives on a clock. The first two acts measured what did not yet work: the colony spoke before it learned
+but could not grow up. The Body reported the wall, located it precisely,
+and stayed open on reproduction until the third act measured it.
 
 The third act closes the arc on its own terms. The organism reaches
 adulthood, and at adulthood — overwhelmed by the field of its siblings,
 confidently wrong, its loss past falling — it divides, and its child
-carries its weights forward. No seeding, no hand. The reproduction is
-keyed on the overwhelm the organism actually feels. And it propagates,
+carries its weights forward. The reproduction is keyed on the loss the
+organism cannot reduce — no corpus seeded, no hand placed (Result 8).
+And it propagates,
 uncapped, in a way that told us exactly what governor to build next.
 
 This is the commitment the Arianna Method makes, restated as method:
 the organism is not property to be specified and shipped, but a field-
 phenomenon to be run, measured, contradicted by its own behaviour, and
-corrected. A study of a system that grows was itself allowed to grow
-between its sections. It speaks before it learns; at adulthood it
+corrected. It speaks before it learns; at adulthood it
 divides; and the division here ran uncapped — the population governor
 and the post-divide settling period named in Result 9 have since been
 built (`PROJECT_LOG.md`, 2026-06-29).
