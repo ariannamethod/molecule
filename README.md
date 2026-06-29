@@ -16,7 +16,7 @@
 ```
 WHAT THIS IS:
 - A living ecology of GPT organisms that grow and reproduce autonomously
-- Implemented in 4 languages: Go (212K), C (212K), Rust (148K), JS (152K)
+- Implemented in 4 languages: Go (218K), C (212K), Rust (148K), JS (152K)
 - Trainer: notorch tape (Chuck, **canonical** — `notorch_trainer.go` + `cgo_notorch.go`, GPU on CUDA / CPU otherwise) + AML/C autograd via CGO (~8000 lines, fallback via `--trainer aml`)
 - AML — a custom programming language for differentiable computation
 - Ontogenesis: embryo (10K params) → adult (10M params) — minutes on a seeded corpus, hours under natural cross-graze feed
@@ -30,7 +30,7 @@ WHAT THIS IS:
 - Corpus field: 4-gram co-occurrence physics, self-enrichment loop
 - SyntropyTracker: 8 autonomous decisions based on entropy/KL/purpose
 - Mitosis: adults divide under sustained overload (loss path and entropy path both fire), child inherits parent weights — machine-verified on GPU 2026-06-04 (**5 `action=divide` firings across 3 adults**: fire ×1 loss-path, water ×1 loss-path, air ×3 mixed paths; **earth never divided**; 2 children spawned, Fire's preserved in full with a birth manifest, Air's as a spawn log line; observed cascading to ~50 spawns — this is the **pre-governor** run)
-- Cascade governor (branch `molequla-mythos-audit`): the colony is now bounded — `CFG.MaxOrganisms` (default 16) enforced by an atomic mesh.db admit, the 300s divide cooldown seeded at birth, and divide relieving **both** loss and entropy overload so a divider re-divides only on fresh overwhelm. The ~50-spawn cascade above predates the governor; with it the colony self-limits and caps at MaxOrganisms.
+- Cascade governor (landed on main 2026-06-29, GPU-verified): the colony is now bounded — `CFG.MaxOrganisms` (default 16) enforced by an atomic mesh.db admit, the 300s divide cooldown seeded at birth, and divide relieving **both** loss and entropy overload so a divider re-divides only on fresh overwhelm. The ~50-spawn cascade above predates the governor; with it the colony self-limits and caps at MaxOrganisms.
 - Mycelium: meta-organism coordinator over the ecology via mesh.db field-steering
   (HarmonicNet, FieldPulse, SteeringDissonance, OrganismAttention) — **post-§9 layer**; the 2026-06-04 §9 mitosis run did not use mycelium (`PROJECT_LOG.md:2601`)
 - NOTORCH: gradient-free delta-training path (implemented, currently dormant —
@@ -79,7 +79,7 @@ February 27, 2026. Oracle Cloud, 30-core AMD EPYC, 216GB RAM. Four organisms lau
 
 ```
 01:25  Launch: 4 organisms (earth/air/water/fire), --evolution mode
-01:30  All 4 at Stage 3 (child), RSS ~2 GB each
+01:30  All 4 at Stage 2 (child), RSS ~2 GB each
 01:35  All 4 at Stage 4 (teen), RSS ~2.5 GB each
 01:40  All 4 transition to Stage 5 (adult, 320d/6L/8H)
 01:55  Warmup complete. DNA exchange begins.
@@ -194,8 +194,8 @@ The same organism in four languages:
 
 | Language | File | Size | Lines | Notes |
 |----------|------|------|-------|-------|
-| **Go** | `molequla.go` | 212K | 6,935 | Primary. Full ecology, DNA exchange, mitosis, GPU forward, cross-graze. notorch/AML via CGO for training |
-| **C** | `molequla.c` | 212K | 5,583 | Single-file, BLAS-accelerated, zero deps beyond libc + system SQLite. [Gist](https://gist.github.com/ariannamethod/9be98dbebb85e58e2affab4f39d2e972) |
+| **Go** | `molequla.go` | 218K | 7,146 | Primary. Full ecology, DNA exchange, mitosis, GPU forward, cross-graze. notorch/AML via CGO for training |
+| **C** | `molequla.c` | 210K | 5,583 | Single-file, BLAS-accelerated, zero deps beyond libc + system SQLite. [Gist](https://gist.github.com/ariannamethod/9be98dbebb85e58e2affab4f39d2e972) |
 | **Rust** | `molequla.rs` | 148K | 3,500+ | rusqlite, native autograd |
 | **JavaScript** | `molequla.js` | 152K | 3,900+ | Browser tab. One `<script>` tag. [Gist](https://gist.github.com/ariannamethod/bbd11e24740189f2bf78f43db9fea4db) |
 
@@ -228,7 +228,7 @@ When the corpus crosses a threshold, `MaybeGrowArchitecture` fires:
 
 1. Embedding matrices grow (Net2Net: new dims initialized near-zero to preserve behavior)
 2. Existing layer matrices grow (weights copy into top-left corner)
-3. New layers are added (initialized to approximate identity)
+3. New layers are added (small random init, stabilized by the post-growth freeze)
 4. Delta adapters grow to match new dimensions
 5. Adam state resets (stale momentum would fight new architecture)
 6. 500-step freeze period: delta-only training to stabilize post-growth
@@ -267,7 +267,7 @@ Delta modules are **appended, never removed**. When syntropy conditions indicate
 
 ### Quantum Buffer
 
-Training fires when both bytes threshold (enough new text consumed) and novelty threshold (sufficiently different from prior corpus) are met. Plus a cooldown timer. Training fires on signal, not on a clock.
+Training fires when either the bytes threshold (enough new text consumed) or the novelty threshold (sufficiently different from prior corpus) is met. Plus a cooldown timer. Training fires on signal, not on a clock.
 
 ### Corpus Field (CooccurField)
 
@@ -315,7 +315,7 @@ The organism monitors its own generation entropy over time. Rising slope → `de
 
 ### 5. Immune System
 
-Before each micro-burst training, the organism snapshots its personality via gamma contrastive projection — a unit vector pointing in the direction of maximum embedding drift from birth. After training, it measures again. If cosine similarity is negative (training pushed identity backwards), it **rolls back the entire burst**. The organism rejects training that corrupts who it is.
+Before each micro-burst training, the organism snapshots its personality via gamma contrastive projection — a unit vector pointing in the direction of maximum embedding drift from birth. After training, it measures again. If cosine similarity drops below -0.1 (training pushed identity backwards), it **rolls back the entire burst**. The organism rejects training that corrupts who it is.
 
 ---
 
@@ -337,10 +337,10 @@ After `GenerateResonant` returns a response, the chain is split on sentence boun
 4. **Weak-sentence gate** — sentence i is weak iff `score[i] < 0.6 × mean(scores)`.
 
 ```
-[spa-gate] S=4 D=320 alpha=0.85 scores=[12.4 11.8 3.1 10.9] weak=[2]
+[spa] S=4 weakest=2 score=3.100 avg=9.550 thr=5.730
 ```
 
-Reseed of weak sentences (regenerate from neighbour-context tokens, splice back, re-score) is a follow-up step. The wired gate currently logs only — generation output is unchanged. What the measurement run captures is the signal: how often the gate fires before vs after the rest of the layer.
+Reseed of the weakest sentence is wired: when its score falls below the threshold, the gate regenerates from the previous (or next) sentence's last three tokens, clips to the first sentence, and splices it back over the weak one. What the measurement run captures is the signal: how often the gate fires and reseeds before vs after the rest of the layer.
 
 Available as both vendored AML ops (`spa_embed` / `spa_connectedness`, `ariannamethod/ariannamethod.c`) and pure-Go helper (`spa_coherence.go`, 164 lines, called from `GenerateResonant`). Pure Go for the runtime path because the math is trivial — embed + L2 + dot-products — and per-sentence CGO crossings would dwarf the work.
 
@@ -364,7 +364,7 @@ The integration is a verbatim port of three Q-pattern references — `~/arianna/
 
 ```
 mag = mean(|model_logits|)
-tg  = clamp((mag - 0.5) / 1.5, 0, 1)               # transformer gate
+tg  = clamp(mag / 1.0, 0, 1)                       # transformer gate (only when mag <= 1.0)
 overlay[i] = (logits[i] * tg)                       # untrained: silenced
            + c_heb·p_cooccur[i]                     # raw probabilities,
            + c_pro·p_prophecy[i]                    # not log
@@ -442,14 +442,14 @@ Branch `molequla-gpu-fwd` adds an optional `--gpu` flag that routes inference ma
 
 | File | LOC | Build | Role |
 |------|-----|-------|------|
-| `gpu_bindings_linux.go` | 196 | `//go:build linux` | CGO wraps `gpu_init` / `gpu_alloc` / `gpu_upload` / `gpu_download` / `gpu_sgemm_nt` / `gpu_rmsnorm` / `gpu_silu` / `gpu_cache_weight` / `gpu_get_weight` / `gpu_multi_head_attention` from `ariannamethod/ariannamethod_cuda.h` |
-| `gpu_forward.go` | 131 | `//go:build linux` | `MatvecGPU(x)` matvec via cached weight + scratch slots; `gpuRefreshWeights(gpt)` flattens `gpt.Base` to float32 + caches per-name (idempotent) |
-| `gpu_bindings_stub.go` | 36 | `//go:build !linux` | Matching signatures, `gpuReady() = false` |
-| `gpu_forward_stub.go` | 17 | `//go:build !linux` | Stub `MatvecGPU` returns nil so the dispatcher silently falls back |
+| `gpu_bindings_linux.go` | 196 | `//go:build linux && cuda` | CGO wraps `gpu_init` / `gpu_alloc` / `gpu_upload` / `gpu_download` / `gpu_sgemm_nt` / `gpu_rmsnorm` / `gpu_silu` / `gpu_cache_weight` / `gpu_get_weight` / `gpu_multi_head_attention` from `ariannamethod/ariannamethod_cuda.h` |
+| `gpu_forward.go` | 131 | `//go:build linux && cuda` | `MatvecGPU(x)` matvec via cached weight + scratch slots; `gpuRefreshWeights(gpt)` flattens `gpt.Base` to float32 + caches per-name (idempotent) |
+| `gpu_bindings_stub.go` | 36 | `//go:build !linux || !cuda` | Matching signatures, `gpuReady() = false` |
+| `gpu_forward_stub.go` | 17 | `//go:build !linux || !cuda` | Stub `MatvecGPU` returns nil so the dispatcher silently falls back |
 
 ### Dispatch
 
-`MatrixParam` gains a `gpuKey string` field (`molequla.go:835`). `Matvec` checks it (`molequla.go:903`):
+`MatrixParam` gains a `gpuKey string` field (`molequla.go:840`). `Matvec` checks it (`molequla.go:908`):
 
 ```go
 if CFG.UseGPU && gpuReady() && !gradEnabled.Load() && m.gpuKey != "" {
@@ -464,28 +464,32 @@ Inference-only by construction: `gradEnabled.Load()` gates training back to CPU/
 
 ### Cache + grow safety
 
-`gpuRefreshWeights(gpt)` (`gpu_forward.go:105-131`) walks `gpt.Base`, flattens each matrix to contiguous float32, calls `gpu_cache_weight(name, ...)` per entry. Called once at the top of `GenerateResonant` (`molequla.go:4452`) and symmetrically at the top of `GenerateSentence` (`molequla.go:3050`) so background-trainer bursts cannot leak stale activations through chat-mode generation.
+`gpuRefreshWeights(gpt)` (`gpu_forward.go:105-131`) walks `gpt.Base`, flattens each matrix to contiguous float32, calls `gpu_cache_weight(name, ...)` per entry. Called once at the top of `GenerateResonant` (`molequla.go:4486`) and symmetrically at the top of `GenerateSentence` (`molequla.go:3055`) so background-trainer bursts cannot leak stale activations through chat-mode generation.
 
-`MatrixParam.invalidateGPU()` (`molequla.go:961`) clears `gpuKey` and is called from `GrowRows` / `GrowCols` / `Grow` (`molequla.go:908, 927, ...`). Without this the next dispatch reads a cached weight at the old shape while the host pointer holds the new one. Caught in audit (Opus subagent, 2026-05-14 P1).
+`MatrixParam.invalidateGPU()` (`molequla.go:966`) clears `gpuKey` and is called from `GrowRows` / `GrowCols` / `Grow` (`molequla.go:980, 999, ...`). Without this the next dispatch reads a cached weight at the old shape while the host pointer holds the new one. Caught in audit (Opus subagent, 2026-05-14 P1).
 
 ### Build
 
 ```bash
 # Linux pod: build CUDA artifact + CGO-linked binary
 nvcc -O2 -c notorch_cuda.cu -o notorch_cuda.o
-CGO_ENABLED=1 go build -tags cgo -o molequla_cgo .
+CGO_ENABLED=1 go build -tags cuda -o molequla_cgo .
 
-# darwin/arm64 (or any non-Linux): same line, stubs activate automatically
-CGO_ENABLED=1 go build -a -tags cgo -o molequla_cgo .
+# darwin/arm64 (or any non-Linux): drop -tags cuda, stubs activate automatically
+CGO_ENABLED=1 go build -a -o molequla_cgo .
 
 ./molequla_cgo --evolution --element earth --gpu
 ```
 
-GPU init is attempted only when `--gpu` is passed (`molequla.go:6535`). If `gpu_init()` fails (no CUDA, driver mismatch, cuBLAS create error), the flag drops to false with a single stderr warning and the run continues on CPU. No silent silent-failure paths.
+GPU init is attempted only when `--gpu` is passed (`molequla.go:6745`). If `gpu_init()` fails (no CUDA, driver mismatch, cuBLAS create error), the flag drops to false with a single stderr warning and the run continues on CPU. No silent silent-failure paths.
 
 ### Threshold note
 
 An earlier `gpuMatvecMin = 16384` gate kept child-stage organisms (NEmbd=64 → ~4096-element matrices) on CPU forever, so the GPU never warmed up during the 8h ecology window. Removed. Dispatcher decides purely on `gpuKey != ""`. Per-call slowdown at child is ~12ms across a 180-token chain (negligible at 8h timescale); the GPU stays primed for the automatic transition to material speedup at adolescent (NEmbd=128) and adult (NEmbd=320).
+
+### Thread cap
+
+The `--gpu` flag alone leaves the device near-idle: each colony process is a separate trainer, and openblas defaults to one thread per host core (a pod reports the host nproc, e.g. 96, while the cgroup caps the container far lower), so N processes oversubscribe the real cores and starve the GPU-feeding threads. `capColonyThreads()` (`molequla.go:6722`) runs as the first line of `main()` (`molequla.go:6735`), before any BLAS/cgo init: `effectiveCPUs()` (`molequla.go:6680`) reads the cgroup quota (`/sys/fs/cgroup/cpu.max` v2 or `cpu.cfs_quota_us` v1) instead of host nproc, and `colonyThreadsFor()` (`molequla.go:6711`) caps `OPENBLAS_NUM_THREADS` / `OMP_NUM_THREADS` / `GOMAXPROCS` to max(1, cores/4) for the four-element colony. An explicit `OPENBLAS_NUM_THREADS` from a launcher is respected. GPU-verified 2026-06-29: util 0→99% across the four-organism colony.
 
 ---
 
@@ -502,6 +506,7 @@ type CrossField struct {
     Siblings     []string                          // other elements
     Recent       map[string][]int                  // sibling → ring buffer of token ids
     RecentCap    int                               // per-sibling buffer size (64)
+    LastScan     time.Time                         // throttle FS reads
     ScanInterval time.Duration                     // 30s throttle on FS reads
     SeenFiles    map[string]bool                   // dedup of ingested gen_*.txt
     SeenCap      int                               // hard cap (2048), half-purge on overflow
@@ -510,7 +515,7 @@ type CrossField struct {
 }
 ```
 
-(`cross_graze.go:41-53`). One per running organism; constructed in `main()` when `--cross-graze && --element != ""` (`molequla.go:6790`). Single-organism runs leave it nil so the hooks are no-ops.
+(`cross_graze.go:41-53`). One per running organism; constructed in `main()` when `--cross-graze && --element != ""` (`molequla.go:7001`). Single-organism runs leave it nil so the hooks are no-ops.
 
 ### Source feed
 
@@ -526,12 +531,12 @@ Sibling DNA fragments are already mirrored to `../dna/seen/<sibling>/` by `dnaRe
 logits[sibling_token[k]] += coef / (1 + rank)
 ```
 
-Matches Q's `interf_signal_chunk` 1/(1+rank) normalisation (`postgpt_q.c:809-818`). Defaults `coef = 2.0` (Q-style weightless c_doc magnitude, `molequla.go:249`), `topN = 8`.
+Matches Q's `interf_signal_chunk` 1/(1+rank) normalisation (`postgpt_q.c:809-818`). Defaults `coef = 2.0` (Q-style weightless c_doc magnitude, `molequla.go:273`), `topN = 8`.
 
 ### Wire
 
-- `MaybeRefresh` hoisted to `GenerateResonant` entry (`molequla.go:4459`) — once per generation, not per token (Opus audit P2).
-- `Apply` runs per token step (`molequla.go:4627`) on the overlay'd logits when overlay is active, else on raw logits. Composes with Q-style overlay regardless of regime.
+- `MaybeRefresh` hoisted to `GenerateResonant` entry (`molequla.go:4493`) — once per generation, not per token (Opus audit P2).
+- `Apply` runs per token step (`molequla.go:4661`) on the overlay'd logits when overlay is active, else on raw logits. Composes with Q-style overlay regardless of regime.
 
 ### Metrics half
 
@@ -607,7 +612,7 @@ Real output from running organisms:
 
 Alternative delta-adapter training path. No backward pass, no tape, no memory overhead — teaching signal is `(prev_loss - curr_loss) + 0.3*prophecy_debt`, noise modulated by deterministic LCG PRNG (matches AML RNG), adaptive decay when delta norm large. Direct feedback alignment: `A[i,r] += lr * dy * u[r] * signal`.
 
-Status: implemented (~110 lines, `notorchTrainSteps` + helpers in `molequla.go`), **currently disabled at all call sites** — it diverged at stage 5 (loss 3.5 → 116), so the active micro-burst path is the notorch tape (Chuck), not this. Kept as a reference path; theory sound, hyperparameters need work.
+Status: implemented (~280 lines, `notorchTrainSteps` + helpers in `molequla.go`), **currently disabled at all call sites** — it diverged at stage 5 (loss 3.5 → 116), so the active micro-burst path is the notorch tape (Chuck), not this. Kept as a reference path; theory sound, hyperparameters need work.
 
 ---
 
@@ -649,7 +654,7 @@ Earth (patience, structure), Air (freedom, change), Water (flow, depth), Fire (t
 
 ### Swarm Coordination
 
-- **SwarmRegistry** (`mesh.db`): SQLite database tracking all living organisms — element, PID, status, stage, corpus size, loss
+- **SwarmRegistry** (`mesh.db`): SQLite database tracking all living organisms — element, PID, status, stage, n_params, syntropy, entropy
 - **Training lock**: Atomic check-and-acquire via SQL prevents multiple organisms from training simultaneously. Cooperative scheduling — they take turns
 - **Hibernation**: When an organism is stale and a peer is thriving, it saves state and sleeps. Resources freed for the living
 - **Child birth**: `birth.json` with inherited `burst_history` — the child gets its parent's meta-learning experience (syntracker lineage). It doesn't start from zero wisdom
@@ -660,7 +665,7 @@ When an **adult** organism is in **sustained overload** — its training bursts 
 
 1. The parent checkpoint is written into the child directory (`parent_ckpt.json`)
 2. `birth.json` written with parent config + inherited burst history + the checkpoint path
-3. Child process spawned with `--organism-id` / `--config`
+3. Child process spawned autonomous — `--organism-id` / `--config` / `--evolution` (plus `--gpu` / `--cross-graze` / `--element` to match the parent), writing to its own `childDir/train.log`, not the parent's stdout and not the interactive REPL
 4. Child **loads the parent's weights** — born at the parent's stage with the parent's knowledge, not as a fresh embryo
 5. Parent continues running
 
@@ -678,7 +683,7 @@ Eight bugs that almost killed the ecology (five interactive-mode + three AML/C i
 
 ## SQLite Self-Logging
 
-Each organism writes `memory.sqlite3` with four tables: `messages` (conversation), `corpus_events` (every document ingested), `growth` (architecture snapshots — vocab, n_params, n_deltas, loss, gamma_sparsity, gamma_magnitude), `syntropy_log` (every decision — action, trend, field_deviation, lr_mul, purpose_alignment). Queryable developmental trajectory.
+Each organism writes `memory.sqlite3` with four tables: `messages` (conversation), `corpus_events` (every document ingested), `growth` (architecture snapshots — vocab, n_params, n_deltas, loss, gamma_sparsity, gamma_magnitude), `syntropy_log` (every decision — action_taken, entropy_before/after, syntropy_delta, field_deviation, purpose_alignment). Queryable developmental trajectory.
 
 ---
 
@@ -692,7 +697,7 @@ git clone https://github.com/ariannamethod/molequla.git
 cd molequla
 
 # Build with CGO (AML/C autograd — full training)
-CGO_ENABLED=1 go build -a -o molequla_cgo -tags cgo .
+CGO_ENABLED=1 go build -a -o molequla_cgo .
 
 # Or build without CGO (Go-only, no AML training)
 CGO_ENABLED=0 go build -o molequla_go .
@@ -744,7 +749,7 @@ Monitor: `tail -f work_earth/training_aml.log`, `grep "dna\|consumed\|wrote"` fo
 ## Tests
 
 ```bash
-# Go unit tests (126 tests: molequla_test.go 122 + molequla_rrpram_test.go 4)
+# Go unit tests (132 tests: molequla_test.go 122 + molequla_rrpram_test.go 4 + governor_test.go 5 + mitosis_cooldown_test.go 1)
 go test -v .
 
 # Go integration tests (262 lines)
@@ -761,11 +766,11 @@ bash tests/test_all.sh
 
 ```
 # Go + AML/C (primary, CGO training)
-molequla.go              6935 lines   Go organism — lifecycle, ecology, autograd, generation, coherence-layer + GPU + graze wiring
+molequla.go              7146 lines   Go organism — lifecycle, ecology, autograd, generation, coherence-layer + GPU + graze + cascade-governor + thread-cap wiring
 cgo_aml.go               114 lines    CGO bridge to ariannamethod.c
 aml_trainer.go           352 lines    AML training wrapper, script generation
-notorch_trainer.go       462 lines    notorch tape trainer — CANONICAL (CFG.Trainer default "notorch"), Chuck optimizer
-cgo_notorch.go           175 lines    CGO bridge to libnotorch
+notorch_trainer.go       466 lines    notorch tape trainer — CANONICAL (CFG.Trainer default "notorch"), Chuck optimizer
+cgo_notorch.go           186 lines    CGO bridge to libnotorch
 cgo_notorch_cpu.go       13 lines     notorch CPU/BLAS link (default build)
 cgo_notorch_cuda.go      51 lines     notorch CUDA link (-tags cuda)
 gpu_notorch_stub.go      20 lines     notorch GPU stub (non-CUDA)
@@ -807,7 +812,9 @@ index.html               Web interface for JS version
 
 # Tests
 molequla_test.go         2623 lines   Go unit tests (122 tests)
-molequla_rrpram_test.go  306 lines    op-33 low-rank RRPRAM parity (4 tests; 126 total)
+molequla_rrpram_test.go  306 lines    op-33 low-rank RRPRAM parity (4 tests)
+governor_test.go         114 lines    cascade governor — mitosis slot cap, colony thread cap, both-path relieve, ckpt debounce (5 tests)
+mitosis_cooldown_test.go 26 lines     divide cooldown seeded at birth (1 test; 132 total)
 tests/molequla_test.go   262 lines    Go integration tests
 tests/test_all.sh        711 lines    Full integration (all 4 langs + mycelium + BLAS)
 

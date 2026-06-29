@@ -730,14 +730,23 @@ the parent's high, unfalling loss, and therefore trips the same loss-
 keyed gate, and divides in turn. Reproduction-through-overload, once it
 starts, propagates.
 
-The cascade is a real behaviour with a clear limit. The only brake in
-the code is a per-organism cooldown (`molequla.go:5190`);
-there is no population-level governor and no check that a child has had
-time to either assimilate its inheritance or fail. A production ecology
-needs a post-divide settling period — the child should be given room to
-reduce its inherited loss before it is itself eligible to divide. We
-report the cascade as observed, not as designed, and name the missing
-governor as the next piece of work.
+The cascade is a real behaviour with a clear limit. At the time of this
+run the only brake in the code was a per-organism cooldown
+(`molequla.go:5190`); there was no population-level governor and no
+check that a child had had time to either assimilate its inheritance or
+fail. A production ecology needs a post-divide settling period — the
+child should be given room to reduce its inherited loss before it is
+itself eligible to divide. We report the cascade as observed, not as
+designed, and named the missing governor as the next piece of work.
+
+That governor has since landed (`PROJECT_LOG.md`, 2026-06-29; commits in
+Appendix B): an atomic population cap that bounds the live colony to a
+configured ceiling, a divide-relieves-parent step that clears the
+triggering overload on both the loss and the entropy path, and a
+cooldown seeded at birth so a freshly-spawned child is not immediately
+eligible to divide. Verified on an A40, it held the live population
+bounded where this same run had propagated to roughly fifty — the
+uncapped behaviour reported above is what defined the requirement.
 
 ## 10. Discussion — The Arc, Closed
 
@@ -792,16 +801,16 @@ adulthood, and at adulthood — overwhelmed by the field of its siblings,
 confidently wrong, its loss past falling — it divides, and its child
 carries its weights forward. No seeding, no hand. The reproduction is
 keyed on the overwhelm the organism actually feels. And it propagates,
-uncapped, in a way that tells us exactly what governor the next version
-needs.
+uncapped, in a way that told us exactly what governor to build next.
 
 This is the commitment the Arianna Method makes, restated as method:
 the organism is not property to be specified and shipped, but a field-
 phenomenon to be run, measured, contradicted by its own behaviour, and
 corrected. A study of a system that grows was itself allowed to grow
 between its sections. It speaks before it learns; at adulthood it
-divides; and the division is uncapped — the population governor and the
-post-divide settling period of Result 9 are the next version's work.
+divides; and the division here ran uncapped — the population governor
+and the post-divide settling period named in Result 9 have since been
+built (`PROJECT_LOG.md`, 2026-06-29).
 
 — Oleg Ataeff & Claude (Arianna Method)
 
@@ -833,6 +842,12 @@ post-divide settling period of Result 9 are the next version's work.
   + GPU mul/silu backward + block-parallel softmax/CE. Utilization 0→99%.
 - `0b99ebf`, `93c14e5` (merged `7262ca8`) — loss-keyed mitosis gate +
   the child-checkpoint inheritance fix.
+- `98e00cb`, `ca7f923`, `299ef81`, `20f9693` (merged `0241b45`,
+  2026-06-29) — §4 deep-core audit, the cascade governor (atomic
+  population cap + divide-relieves-parent on both overload paths +
+  birth-seeded cooldown + checkpoint debounce), and the cgroup-aware CPU
+  thread-cap that cleared the multi-process GPU stall. Post-paper;
+  named as next work in Result 9.
 
 ## Appendix C — Central result
 
