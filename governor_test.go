@@ -43,6 +43,21 @@ func TestMitosisSlotAtomicCap(t *testing.T) {
 	}
 }
 
+// CPU thread-cap (GPU multi-process stall fix): the 4-element colony shares the
+// cores without oversubscription. 9-core cgroup → 2/org (the RunPod case, verified
+// util 99% vs the 96-thread/proc stall).
+func TestColonyThreadsFor(t *testing.T) {
+	if g := colonyThreadsFor(9); g != 2 {
+		t.Fatalf("9 cores → want 2 threads/org, got %d", g)
+	}
+	if g := colonyThreadsFor(96); g != 24 {
+		t.Fatalf("96 cores → 24, got %d", g)
+	}
+	if g := colonyThreadsFor(2); g != 1 {
+		t.Fatalf("2 cores → floor 1, got %d", g)
+	}
+}
+
 // (c) divide relieves the parent — after relieveOverload the triggering high-loss
 // bursts are gone, so lossOverload() (and thus the divide gate) reads false until
 // NEW overload accumulates.

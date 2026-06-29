@@ -21,6 +21,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -6671,8 +6672,68 @@ func buildPromptFromMemory(db *sql.DB, userText string) string {
 //              it is time to declare the final function.
 // ============================================================
 
+// effectiveCPUs returns the cores actually available to THIS process — the cgroup
+// CPU quota when limited (RunPod/containers report the HOST's NumCPU but cap us via
+// cgroup), else runtime.NumCPU(). Reading the host nproc made openblas spawn one
+// thread per HOST core (e.g. 96); N colony processes then oversubscribed the few
+// real cgroup cores ~40x and the GPU-feeding threads starved into a hard stall.
+func effectiveCPUs() int {
+	n := runtime.NumCPU()
+	if b, err := os.ReadFile("/sys/fs/cgroup/cpu.max"); err == nil { // cgroup v2
+		f := strings.Fields(string(b))
+		if len(f) == 2 && f[0] != "max" {
+			if q, e1 := strconv.Atoi(f[0]); e1 == nil {
+				if p, e2 := strconv.Atoi(f[1]); e2 == nil && q > 0 && p > 0 {
+					if c := q / p; c >= 1 && c < n {
+						n = c
+					}
+				}
+			}
+		}
+	}
+	if qb, err := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"); err == nil { // cgroup v1
+		if q, e1 := strconv.Atoi(strings.TrimSpace(string(qb))); e1 == nil && q > 0 {
+			if pb, e2 := os.ReadFile("/sys/fs/cgroup/cpu/cpu.cfs_period_us"); e2 == nil {
+				if p, e3 := strconv.Atoi(strings.TrimSpace(string(pb))); e3 == nil && p > 0 {
+					if c := q / p; c >= 1 && c < n {
+						n = c
+					}
+				}
+			}
+		}
+	}
+	return n
+}
+
+// colonyThreadsFor caps BLAS threads per organism so the base 4-element colony
+// shares the cores without oversubscription (the cause of the multi-process GPU
+// stall): cores/4, floored at 1.
+func colonyThreadsFor(cores int) int {
+	t := cores / 4
+	if t < 1 {
+		t = 1
+	}
+	return t
+}
+
+// capColonyThreads pins per-process BLAS / Go threads to the cgroup-aware core share
+// BEFORE any BLAS init, so N concurrent organisms don't thrash the CPU and stall the
+// GPU. Respects an explicit OPENBLAS_NUM_THREADS override (e.g. from a launcher).
+func capColonyThreads() {
+	cores := effectiveCPUs()
+	runtime.GOMAXPROCS(cores)
+	if os.Getenv("OPENBLAS_NUM_THREADS") != "" {
+		return
+	}
+	per := strconv.Itoa(colonyThreadsFor(cores))
+	os.Setenv("OPENBLAS_NUM_THREADS", per)
+	os.Setenv("OMP_NUM_THREADS", per)
+	fmt.Fprintf(os.Stderr, "[cpu] effective cores=%d → OPENBLAS_NUM_THREADS=%s (colony oversubscription guard)\n", cores, per)
+}
+
 func main() {
-	rand.Seed(42) // And lo, determinism shall pretend to tame chaos.
+	capColonyThreads() // cgroup-aware thread cap — prevents the multi-process GPU stall; MUST run before any BLAS/cgo init
+	rand.Seed(42)      // And lo, determinism shall pretend to tame chaos.
 
 	// Parse CLI args for child organisms
 	organismID, configPath, element, evolution := parseCLIArgs()
