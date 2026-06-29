@@ -2619,3 +2619,64 @@ mesh.db contract: writes `field_steering`, reads the SwarmRegistry `organisms` t
 the paper does not reference it.
 
 — polygon Claude (Arianna Method)
+
+### Cascade governor + Mythos §4 audit + the GPU stall fix (2026-06-29)
+
+Branch `molequla-mythos-audit`. Closes the §9 "production wants a post-divide cooldown
+guard" note (the ~50-spawn / 54-proc runaway above) AND the eternal "molequla almost
+always runs CPU, barely touches the GPU" problem. Four commits over the paper-clearance
+head `d18aec5`:
+
+**`98e00cb` — Mythos §4 deep-core audit (4 bugs).** (1+6) mitosis cooldown was never
+seeded → first divide could fire at t=0; `NewSyntropyTracker` now seeds
+`LastMitosisTime` at birth. (7) child `cmd.Wait()` ran inline → late reap; moved to a
+`go func(){ cmd.Wait(); childLog.Close() }()`. (4) GPU readback read stale device
+memory → `notorch_trainer.go` now calls `ntTensorSyncCPU` (→ `nt_tensor_sync_cpu`)
+before every host readback.
+
+**`ca7f923` → `299ef81` — cascade governor (v1, then reworked per an Opus
+second-opinion audit).** v1 was loss-path-only and its child-spawn was broken; the
+second opinion + a live run caught C2/C3/C4 + two spawn bugs. v2 lands: **C3 atomic
+population cap** — `AcquireMitosisSlot(max)` is a single TOCTOU-safe SQL
+`INSERT … WHERE NOT EXISTS(concurrent lock) AND (count alive) < max` over the shared
+`mesh.db` (no check-then-act overshoot); **C2 divide-relieves-parent on BOTH paths** —
+`relieveOverload` now drops the triggering high-loss bursts AND the high-entropy samples
+(v1 relieved only loss → §9 Air, which divided on entropy, kept re-firing); **C4** —
+relieve + `LastMitosisTime` are set BEFORE the child's `birth.json`, so the inheriting
+child is not born already-overloaded; **BUG A** — the child was spawned into the
+interactive REPL; now `--organism-id … --config birth.json --evolution` (+ `--gpu` /
+`--cross-graze` / `--element` passthrough) so it trains autonomously; **BUG B** — child
+stdout now → its own `childDir/train.log`, not mixed into the parent. Plus a checkpoint
+debouncer (`CheckpointMinInterval` 30s) against the write-storm.
+
+**`20f9693` — cgroup-aware CPU thread cap (the GPU stall fix).** Root cause of the
+eternal "almost always CPU, never GPU" symptom: openblas spawned host-`nproc` (96 on
+the pod) BLAS threads PER organism → 4 × 96 = 384 threads on a cgroup-limited ~7–9
+cores → the box thrashed on thread contention and the GPU sat at ~1% launch-bound.
+Fix: `capColonyThreads()` runs first thing in `main()`, reads the real budget from
+`/sys/fs/cgroup/cpu.max` (v2) / `cpu.cfs_quota_us` (v1) — NOT `runtime.NumCPU()` which
+reports the host — and sets `GOMAXPROCS` + `OPENBLAS_NUM_THREADS`/`OMP_NUM_THREADS` to
+`max(1, cores/4)` (respecting any pre-set env override). The colony shares the cores
+instead of fighting over them.
+
+**GPU verification (RunPod A40, pod `gp0a7aqim498ip`, now EXITED — 0 billing).** Built
+on-pod with `go build -tags cuda` against `notorch make install USE_CUDA=1`. The fix is
+proven on the committed binary with NO launcher env var: each org logs
+`[cpu] effective cores=7 → OPENBLAS_NUM_THREADS=1`, GPU utilization sustained at **99%**
+(vs the 0–1% stall), all four organism logs stay fresh (no freeze), 0 NaN. With the
+colony un-stalled it then exercised the governor live: **10 `MITOSIS triggered`**
+firings; the overload gate fired on the **loss path ×10 and the entropy path ×1**
+(`overload=true (e=true l=true)` observed — the C2 entropy case); **20 child dirs, every
+one `REPL=0`** with its own `train.log` and active training (BUG A/B confirmed dead);
+children exit `shutting down gracefully` (not crash); 0 NaN across all 20+. Live
+population stayed **bounded at 4 (≤ cap 6)** the whole run — the pre-governor ~50
+runaway is gone. The cap's hard REFUSE was not stress-triggered live because relieve +
+cooldown self-limited the colony BELOW the ceiling; the refuse-at-cap and
+no-concurrent-overshoot paths are covered by `TestMitosisSlotAtomicCap`.
+
+**Tests:** 140 green (`go test ./...`, CPU notorch) — governor/audit-specific:
+`TestMitosisSlotAtomicCap`, `TestColonyThreadsFor` (9→2, 96→24, 2→1),
+`TestDivideRelievesParent`, `TestDivideRelievesParentEntropy`, `TestCheckpointDebounce`,
+`TestMitosisCooldownSeededAtBirth`. Branch not yet merged to main (pending Oleg's word).
+
+— polygon Claude (Arianna Method)
