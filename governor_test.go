@@ -112,3 +112,38 @@ func TestCheckpointDebounce(t *testing.T) {
 	}
 }
 
+// (M-GOV-001) A reserved child slot counts toward the population cap immediately,
+// so a sibling cannot overshoot the cap in the window before the child boots and
+// self-registers. Before the fix the cap only saw self-registered organisms, so a
+// spawned-but-not-yet-registered child let the next AcquireMitosisSlot admit an
+// over-cap divide.
+func TestReservedChildCountsTowardCap(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Skipf("sqlite unavailable: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE organisms(id TEXT PRIMARY KEY, pid INTEGER, stage INTEGER, n_params INTEGER, syntropy REAL, entropy REAL, last_heartbeat REAL, parent_id TEXT, status TEXT, element TEXT)`); err != nil {
+		t.Skipf("sqlite exec: %v", err)
+	}
+	db.Exec(`CREATE TABLE mitosis_lock(organism_id TEXT PRIMARY KEY, acquired_at REAL)`)
+	now := float64(time.Now().UnixMilli()) / 1000.0
+	for _, id := range []string{"a", "b", "c"} { // 3 live
+		db.Exec(`INSERT INTO organisms(id,status,last_heartbeat) VALUES(?,?,?)`, id, "alive", now)
+	}
+	parent := &SwarmRegistry{OrganismID: "a", MeshDB: db}
+
+	if !parent.AcquireMitosisSlot(4) {
+		t.Fatal("3 live < cap 4 must admit the divide")
+	}
+	// The parent reserves the child's slot immediately on a successful spawn.
+	parent.ReserveChildSlot("a_child", 12345, "earth")
+	parent.ReleaseMitosisLock()
+
+	// Now 4 live (3 originals + the reserved child) at cap 4: the next divide MUST
+	// be refused even though the child has not yet self-registered on its own.
+	if parent.AcquireMitosisSlot(4) {
+		t.Fatal("reserved child must count toward the cap: 4 live at cap 4 must refuse")
+	}
+}
+

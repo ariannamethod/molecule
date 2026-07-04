@@ -4471,10 +4471,16 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 	if !useModel || model == nil {
 		return CorpusGenerate(tok, field, prompt, CFG.CorpusGenMaxTokens)
 	}
-
 	model.mu.Lock()
 	defer model.mu.Unlock()
+	return generateResonantLocked(model, tok, field, prompt, docs, useModel)
+}
 
+// generateResonantLocked is the body of GenerateResonant. The caller MUST already
+// hold model.mu. Split out so the SPA reseed path (which runs while the lock is
+// held) can recurse without re-locking the non-reentrant model.mu — the recursive
+// re-lock was a self-deadlock (M-LCK-001).
+func generateResonantLocked(model *GPT, tok *EvolvingTokenizer, field *CooccurField, prompt string, docs []string, useModel bool) string {
 	gradEnabled.Store(false)
 	defer func() { gradEnabled.Store(true) }()
 
@@ -5007,7 +5013,7 @@ func GenerateResonant(model *GPT, tok *EvolvingTokenizer, field *CooccurField, p
 							// Recursive call — disable SPA inside.
 							savedSPA := CFG.SPACoherenceGate
 							CFG.SPACoherenceGate = false
-							regenerated := GenerateResonant(model, tok, field, seedPrompt, docs, true)
+							regenerated := generateResonantLocked(model, tok, field, seedPrompt, docs, true)
 							CFG.SPACoherenceGate = savedSPA
 							regenerated = strings.TrimSpace(regenerated)
 							newSentence := strings.TrimSpace(firstSentence(regenerated))
@@ -5562,6 +5568,22 @@ func (sr *SwarmRegistry) registerInMesh() error {
 	return err
 }
 
+// ReserveChildSlot inserts a freshly-spawned child into the mesh as 'alive' with a
+// current heartbeat, so AcquireMitosisSlot's population cap counts it immediately
+// (M-GOV-001). Without this the child is invisible to the cap until it boots and
+// self-registers, letting a sibling overshoot the cap in that window. The child
+// overwrites this row on its own registerInMesh (INSERT OR REPLACE, same id). A
+// child that never boots ages out of the cap once its heartbeat goes stale.
+func (sr *SwarmRegistry) ReserveChildSlot(childID string, pid int, element string) {
+	if sr.MeshDB == nil {
+		return
+	}
+	sr.MeshDB.Exec(
+		"INSERT OR REPLACE INTO organisms(id,pid,stage,n_params,syntropy,entropy,last_heartbeat,parent_id,status,element) "+
+			"VALUES(?,?,0,0,0.0,0.0,?,?,'alive',?)",
+		childID, pid, float64(time.Now().UnixMilli())/1000.0, sr.OrganismID, element)
+}
+
 // Heartbeat performs periodic state update in mesh.db.
 func (sr *SwarmRegistry) Heartbeat(stage, nParams int, syntropy, entropy float64) {
 	if sr.MeshDB == nil {
@@ -5668,11 +5690,46 @@ func (sr *SwarmRegistry) ReleaseTrainingLock() {
 // performMitosis divides the organism. Parent continues. The child inherits the
 // parent's growth stage via the checkpoint dimensions (not infant).
 func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *SwarmRegistry, syntracker *SyntropyTracker) (string, error) {
-	childID := fmt.Sprintf("org_%d_%d", time.Now().Unix(), rand.Intn(9000)+1000)
-	childDir := filepath.Join(os.Getenv("HOME"), ".molequla", childID)
-	if err := os.MkdirAll(childDir, 0755); err != nil {
+	// M-SPAWN-002: allocate a unique child dir EXCLUSIVELY. os.MkdirAll silently
+	// reuses an existing dir, so a childID collision (same second, or the governor
+	// disabled) let two children share a dir and organism id. UnixNano+pid+rand plus
+	// an exclusive os.Mkdir (which fails if the dir exists) makes a collision both
+	// astronomically unlikely and detected.
+	baseDir := filepath.Join(os.Getenv("HOME"), ".molequla")
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
 		return "", err
 	}
+	var childID, childDir string
+	for attempt := 0; attempt < 8; attempt++ {
+		childID = fmt.Sprintf("org_%d_%d_%d", time.Now().UnixNano(), os.Getpid(), rand.Intn(1000000))
+		childDir = filepath.Join(baseDir, childID)
+		err := os.Mkdir(childDir, 0755)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return "", err
+		}
+		childID = ""
+	}
+	if childID == "" {
+		return "", fmt.Errorf("mitosis: could not allocate a unique child dir")
+	}
+
+	// M-SPAWN-001: a failed spawn must NOT leave the parent "relieved" and cooled
+	// down with no child. Snapshot the overload state and restore it unless the
+	// spawn commits (committed=true just before the successful return below).
+	savedLMT := syntracker.LastMitosisTime
+	savedBH := append([]BurstRecord(nil), syntracker.BurstHistory...)
+	savedEH := append([]float64(nil), syntracker.EntropyHistory...)
+	committed := false
+	defer func() {
+		if !committed {
+			syntracker.LastMitosisTime = savedLMT
+			syntracker.BurstHistory = savedBH
+			syntracker.EntropyHistory = savedEH
+		}
+	}()
 
 	// (audit C4 + c) Relieve the parent's overload and stamp the cooldown BEFORE
 	// capturing the inherited history below — so the child does NOT inherit a
@@ -5747,6 +5804,15 @@ func performMitosis(model *GPT, tok *EvolvingTokenizer, db *sql.DB, swarm *Swarm
 	// Reap the child on its eventual exit (no zombie of this long-lived parent)
 	// and close its log handle.
 	go func() { _ = cmd.Wait(); if childLog != nil { childLog.Close() } }()
+
+	// M-GOV-001: reserve the child's slot in the mesh NOW so the population cap
+	// counts it immediately. Otherwise a sibling's AcquireMitosisSlot, run in the
+	// window before the child self-registers, sees COUNT < cap and admits an
+	// over-cap spawn. The child overwrites this row (INSERT OR REPLACE) on boot.
+	swarm.ReserveChildSlot(childID, cmd.Process.Pid, swarm.Element)
+
+	// M-SPAWN-001: the spawn is committed — keep the relieved/cooled parent state.
+	committed = true
 
 	fmt.Printf("[ecology] Child %s spawned (pid=%d) — log %s/train.log\n", childID, cmd.Process.Pid, childDir)
 	return childID, nil

@@ -2,6 +2,7 @@ package main
 
 /*
 #cgo CFLAGS: -I/usr/local/include/ariannamethod -O2
+#cgo darwin CFLAGS: -I/opt/homebrew/include
 #cgo linux CFLAGS: -DUSE_BLAS -I/usr/include/x86_64-linux-gnu/openblas-pthread/
 #include <notorch.h>
 #include <string.h>
